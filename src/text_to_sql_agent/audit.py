@@ -44,7 +44,7 @@ class AuditTrace:
         self.steps.append(step)
         if self.path is not None:
             with self.path.open("a") as handle:
-                handle.write(json.dumps(step.to_dict()) + "\n")
+                handle.write(json.dumps(step.to_dict(), ensure_ascii=False) + "\n")
         return step
 
     def to_list(self) -> list[dict[str, Any]]:

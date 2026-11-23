@@ -219,7 +219,7 @@ def ask(
         trace.record("approval", decision="confirmed", auto=True)
 
     plan = connection.execute(f"EXPLAIN {final_sql}").fetchall()
-    trace.record("explain", plan="\n".join(str(row) for row in plan))
+    trace.record("explain", plan="\n".join(row[-1] for row in plan))
 
     result = connection.execute(final_sql)
     columns = [description[0] for description in result.description]
