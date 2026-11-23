@@ -1,8 +1,10 @@
 """Command-line entry point.
 
-Two commands exist so far: ``init-warehouse`` generates the local sample
-data, and ``ask`` runs a question through the draft/validate/correct loop
-against it. Everything ``ask`` does is written to an audit trace.
+``init-warehouse`` generates the local sample data, ``inspect-schema``
+prints the catalog built from it, ``validate`` checks a SQL string against
+the safety contract without running it, and ``ask`` runs a question
+through the full draft/validate/correct/approve/execute loop. Everything
+``ask`` does is written to an audit trace.
 """
 
 from __future__ import annotations
@@ -64,6 +66,40 @@ def inspect_schema(warehouse_dir: Path) -> None:
     """Print the schema catalog built from the sample warehouse."""
     catalog = _build_catalog(warehouse_dir)
     click.echo(catalog.to_text())
+
+
+@main.command("validate")
+@click.argument("sql")
+@click.option(
+    "--warehouse-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=DEFAULT_WAREHOUSE_DIR,
+    show_default=True,
+)
+@click.option("--dialect", type=click.Choice(["duckdb"]), default="duckdb", show_default=True)
+@click.option("--row-limit", type=int, default=None)
+def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None) -> None:
+    """Check SQL against the safety contract without executing it.
+
+    Reports whether SQL is a single, read-only, allowlisted statement, and
+    prints the normalized query (with LIMIT enforced) if so.
+    """
+    catalog = _build_catalog(warehouse_dir)
+    default_row_limit = row_limit if row_limit is not None else AgentConfig().default_row_limit
+    result = validate_query(
+        sql,
+        table_allowlist=catalog.table_names,
+        dialect=dialect,
+        default_row_limit=default_row_limit,
+    )
+    if result.is_valid:
+        click.echo("VALID")
+        click.echo(result.normalized_sql)
+    else:
+        click.echo("REJECTED")
+        for error in result.errors:
+            click.echo(f"  - {error}")
+        sys.exit(1)
 
 
 @main.command("ask")
