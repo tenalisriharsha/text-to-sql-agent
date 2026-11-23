@@ -205,18 +205,18 @@ def ask(
         trace.record("final", outcome="budget_exceeded")
         sys.exit(1)
 
-    click.echo(f"SQL:\n{final_sql}\n")
     click.echo(f"estimated scan: {bytes_estimate} bytes (~${cost_estimate:.4f})")
 
     if config.require_human_approval and not yes:
-        if cost_estimate > config.budget.confirm_above_usd:
-            if not click.confirm("Proceed with execution?", default=False):
-                trace.record("final", outcome="rejected_by_user")
-                click.echo("aborted.")
-                return
+        if not click.confirm("Proceed with execution?", default=False):
+            trace.record("final", outcome="rejected_by_user")
+            click.echo("aborted.")
+            return
         trace.record("approval", decision="confirmed", auto=False)
     else:
         trace.record("approval", decision="confirmed", auto=True)
+
+    click.echo(f"SQL:\n{final_sql}\n")
 
     plan = connection.execute(f"EXPLAIN {final_sql}").fetchall()
     trace.record("explain", plan="\n".join(row[-1] for row in plan))

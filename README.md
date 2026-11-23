@@ -114,8 +114,11 @@ Every candidate query, however it was drafted, must pass
 - `AgentConfig` — `max_correction_attempts`, `default_row_limit`,
   `require_human_approval`, and a `BudgetConfig`.
 - `BudgetConfig` — `max_bytes_scanned` and `max_cost_usd` (hard refusal
-  ceilings), `confirm_above_usd` (soft threshold that triggers a human
-  confirmation prompt instead of a refusal), and a `pricing_model`.
+  ceilings), `confirm_above_usd` (a softer threshold below the ceiling,
+  reserved for integrations building their own approval flow on top of this
+  config — the bundled CLI's `ask` command always prompts for approval
+  unless `--yes` is passed, regardless of this threshold), and a
+  `pricing_model`.
 - `PricingModel` — bytes-scanned pricing; `ATHENA_PRICING` ($5/TiB) and
   `BIGQUERY_PRICING` ($6.25/TiB) ship built in.
 

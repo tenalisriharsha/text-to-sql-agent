@@ -56,8 +56,11 @@ class BudgetConfig:
 
     ``max_bytes_scanned`` and ``max_cost_usd`` are hard ceilings: an estimate
     above either is refused outright. ``confirm_above_usd`` is a softer
-    threshold below the hard ceiling: an estimate above it still runs, but
-    only after explicit human confirmation.
+    threshold below the hard ceiling, reserved for integrations that want to
+    distinguish "cheap enough to auto-approve" from "needs a closer look"
+    when building their own approval flow on top of this config; the
+    bundled CLI's approval gate (``ask``) always asks for human confirmation
+    unless ``--yes`` is passed, regardless of this threshold.
     """
 
     pricing_model: PricingModel = ATHENA_PRICING
