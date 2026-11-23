@@ -35,9 +35,9 @@ gates execution.
 
 | | |
 |---|---|
-| ![Ask a simple question](docs/screenshots/01-ask-simple.png) | ![Join across tables](docs/screenshots/02-ask-join.png) |
-| ![Self-correction on a bad draft](docs/screenshots/03-self-correction.png) | ![Validator rejects unsafe SQL](docs/screenshots/04-validator-rejects.png) |
-| ![Inspecting the schema catalog](docs/screenshots/05-inspect-schema.png) | ![Dialect translation to BigQuery/Athena](docs/screenshots/06-dialect-translate.png) |
+| ![Ask a simple question](docs/screenshots/01-ask-simple.png) | ![Ask a question involving a join](docs/screenshots/02-ask-join.png) |
+| ![validate enforces the safety contract](docs/screenshots/03-validate-safety.png) | ![Inspecting the schema catalog](docs/screenshots/04-inspect-schema.png) |
+| ![Dialect translation to BigQuery/Athena](docs/screenshots/05-dialect-translate.png) | ![Every step recorded to an audit trace](docs/screenshots/06-audit-trace.png) |
 
 ## How it works
 
@@ -72,6 +72,9 @@ text-to-sql-agent init-warehouse [--output-dir data/warehouse] [--seed 42]
 
 # Print the schema catalog built from it
 text-to-sql-agent inspect-schema [--warehouse-dir data/warehouse]
+
+# Check SQL against the safety contract without running it
+text-to-sql-agent validate "SELECT * FROM orders" [--warehouse-dir data/warehouse] [--row-limit N]
 
 # Ask a question
 text-to-sql-agent ask "QUESTION" \

@@ -75,7 +75,7 @@ src/text_to_sql_agent/
   llm/               base.py (LLMProvider ABC, CorrectionContext), scripted.py (deterministic provider)
   sql/               validator.py (sqlglot-based validation + LIMIT enforcement), dialect.py (Athena/BigQuery translation)
   audit.py           AuditTrace (JSON Lines trace writer/reader)
-  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|ask`
+  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|validate|ask`
 ```
 
 ## Build plan
@@ -96,7 +96,8 @@ src/text_to_sql_agent/
       allowlist, `LIMIT` injection/clamping.
 - [x] `sql/dialect.py`: SQL translation between duckdb/athena(trino)/bigquery.
 - [x] `audit.py`: `AuditTrace`, an append-only JSON Lines step recorder.
-- [x] `cli.py`: `init-warehouse`, `inspect-schema`, and `ask` — wires the
+- [x] `cli.py`: `init-warehouse`, `inspect-schema`, `validate`, and `ask` —
+      `validate` exposes the safety contract directly, and `ask` wires the
       draft/validate/correct loop, a naive scan-cost estimate, a human
       approval prompt, `EXPLAIN`, and execution together end to end.
 - [x] Manually exercised every command and the correction loop against the
@@ -142,7 +143,7 @@ src/text_to_sql_agent/
 ## Resume point
 
 Everything in Phase 1 is implemented, installed in editable mode, and has
-been run by hand end to end (`init-warehouse`, `inspect-schema`, `ask` with
+been run by hand end to end (`init-warehouse`, `inspect-schema`, `validate`, `ask` with
 single-shot and self-correcting drafts, dialect translation to
 Athena/BigQuery, and the audit trace). Pick up at **Phase 2**: start with
 the embedding index (new `retrieval.py` module under `text_to_sql_agent/`)
