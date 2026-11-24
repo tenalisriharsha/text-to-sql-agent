@@ -89,9 +89,15 @@ class AgentConfig:
     table_allowlist: tuple[str, ...] = field(default_factory=tuple)
     require_human_approval: bool = True
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    retrieval_top_k_tables: int | None = 2
+    retrieval_top_k_columns_per_table: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_correction_attempts < 0:
             raise ValueError("max_correction_attempts must be non-negative")
         if self.default_row_limit <= 0:
             raise ValueError("default_row_limit must be positive")
+        if self.retrieval_top_k_tables is not None and self.retrieval_top_k_tables <= 0:
+            raise ValueError("retrieval_top_k_tables must be positive")
+        if self.retrieval_top_k_columns_per_table is not None and self.retrieval_top_k_columns_per_table <= 0:
+            raise ValueError("retrieval_top_k_columns_per_table must be positive")

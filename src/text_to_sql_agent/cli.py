@@ -16,10 +16,11 @@ from pathlib import Path
 import click
 import duckdb
 
+from text_to_sql_agent.agent import run_agent_loop
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig
-from text_to_sql_agent.llm.base import CorrectionContext
-from text_to_sql_agent.llm.scripted import ScriptedProvider, UnsupportedQuestionError
+from text_to_sql_agent.llm.scripted import ScriptedProvider
+from text_to_sql_agent.retrieval import SchemaRetriever
 from text_to_sql_agent.schema_catalog import SchemaCatalog
 from text_to_sql_agent.sql.validator import validate_query
 from text_to_sql_agent.warehouse.generate import (
@@ -66,6 +67,49 @@ def inspect_schema(warehouse_dir: Path) -> None:
     """Print the schema catalog built from the sample warehouse."""
     catalog = _build_catalog(warehouse_dir)
     click.echo(catalog.to_text())
+
+
+@main.command("retrieve")
+@click.argument("question")
+@click.option(
+    "--warehouse-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=DEFAULT_WAREHOUSE_DIR,
+    show_default=True,
+)
+@click.option(
+    "--top-k-tables",
+    type=int,
+    default=None,
+    help="Keep only the top-k ranked tables. Default: rank, show all.",
+)
+@click.option(
+    "--top-k-columns",
+    type=int,
+    default=None,
+    help="Within each kept table, keep only the top-k ranked columns.",
+)
+def retrieve(question: str, warehouse_dir: Path, top_k_tables: int | None, top_k_columns: int | None) -> None:
+    """Rank the catalog's tables against QUESTION and show the narrowed schema.
+
+    This is the retrieval step `ask` runs internally before drafting SQL,
+    exposed directly so the ranking and narrowing can be inspected on their
+    own. Scores are TF-IDF cosine similarity between the question and each
+    table's/column's name, description, and sample values -- no network
+    call or embedding API is involved.
+    """
+    catalog = _build_catalog(warehouse_dir)
+    retriever = SchemaRetriever(catalog)
+
+    click.echo("ranked tables:")
+    for match in retriever.rank_tables(question):
+        click.echo(f"  {match.score:.4f}  {match.table}")
+
+    narrowed = retriever.retrieve(
+        question, top_k_tables=top_k_tables, top_k_columns_per_table=top_k_columns
+    )
+    click.echo("\nretrieved schema context:")
+    click.echo(narrowed.to_text())
 
 
 @main.command("validate")
@@ -133,6 +177,18 @@ def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None)
 )
 @click.option("--max-correction-attempts", type=int, default=None)
 @click.option("--row-limit", type=int, default=None)
+@click.option(
+    "--top-k-tables",
+    type=int,
+    default=None,
+    help="Retrieval: keep only the top-k ranked tables in the provider's schema context.",
+)
+@click.option(
+    "--top-k-columns",
+    type=int,
+    default=None,
+    help="Retrieval: within each kept table, keep only the top-k ranked columns.",
+)
 def ask(
     question: str,
     warehouse_dir: Path,
@@ -142,35 +198,64 @@ def ask(
     yes: bool,
     max_correction_attempts: int | None,
     row_limit: int | None,
+    top_k_tables: int | None,
+    top_k_columns: int | None,
 ) -> None:
     """Draft, validate, and (after approval) execute SQL for QUESTION."""
+    defaults = AgentConfig()
     config = AgentConfig(
         max_correction_attempts=max_correction_attempts
         if max_correction_attempts is not None
-        else AgentConfig().max_correction_attempts,
-        default_row_limit=row_limit if row_limit is not None else AgentConfig().default_row_limit,
+        else defaults.max_correction_attempts,
+        default_row_limit=row_limit if row_limit is not None else defaults.default_row_limit,
+        retrieval_top_k_tables=top_k_tables if top_k_tables is not None else defaults.retrieval_top_k_tables,
+        retrieval_top_k_columns_per_table=top_k_columns
+        if top_k_columns is not None
+        else defaults.retrieval_top_k_columns_per_table,
     )
 
     trace = AuditTrace(audit_log)
     trace.record("question_received", question=question, dialect=dialect)
 
     catalog = _build_catalog(warehouse_dir)
-    trace.record("schema_retrieved", tables=list(catalog.table_names))
+    retriever = SchemaRetriever(catalog)
+    retrieved_catalog = retriever.retrieve(
+        question,
+        top_k_tables=config.retrieval_top_k_tables,
+        top_k_columns_per_table=config.retrieval_top_k_columns_per_table,
+    )
+    trace.record(
+        "schema_retrieved",
+        tables=list(catalog.table_names),
+        retrieved_tables=list(retrieved_catalog.table_names),
+    )
+
+    connection = duckdb.connect()
+    load_into_duckdb(connection, _warehouse_info(warehouse_dir))
 
     provider = ScriptedProvider()
-    sql, validation = _draft_and_validate(
-        provider, question, catalog, dialect, config, trace
+    agent_result = run_agent_loop(
+        provider,
+        question,
+        retrieved_catalog.to_text(),
+        catalog.table_names,
+        dialect,
+        connection,
+        config,
+        trace,
     )
-    if validation is None:
-        click.echo(f"could not answer the question: {sql}", err=True)
+    if agent_result.draft_error is not None:
+        click.echo(f"could not answer the question: {agent_result.draft_error}", err=True)
         sys.exit(1)
-    if not validation.is_valid:
+
+    validation = agent_result.validation
+    if validation is None or not validation.is_valid:
+        errors = list(validation.errors) if validation is not None else []
         click.echo(
-            "validation failed after exhausting correction attempts:\n  "
-            + "\n  ".join(validation.errors),
+            "validation failed after exhausting correction attempts:\n  " + "\n  ".join(errors),
             err=True,
         )
-        trace.record("final", outcome="validation_failed", errors=list(validation.errors))
+        trace.record("final", outcome="validation_failed", errors=errors)
         sys.exit(1)
 
     final_sql = validation.normalized_sql
@@ -183,9 +268,6 @@ def ask(
         click.echo(final_sql)
         trace.record("final", outcome="translated", dialect=target_dialect, sql=final_sql)
         return
-
-    connection = duckdb.connect()
-    load_into_duckdb(connection, _warehouse_info(warehouse_dir))
 
     bytes_estimate = _estimate_bytes_scanned(warehouse_dir, validation.referenced_tables)
     cost_estimate = config.budget.estimate_cost_usd(bytes_estimate)
@@ -218,8 +300,7 @@ def ask(
 
     click.echo(f"SQL:\n{final_sql}\n")
 
-    plan = connection.execute(f"EXPLAIN {final_sql}").fetchall()
-    trace.record("explain", plan="\n".join(row[-1] for row in plan))
+    trace.record("explain", plan=agent_result.explain_plan)
 
     result = connection.execute(final_sql)
     columns = [description[0] for description in result.description]
@@ -231,38 +312,6 @@ def ask(
         click.echo(" | ".join(str(value) for value in row))
 
     trace.record("final", outcome="executed", sql=final_sql, row_count=len(rows))
-
-
-def _draft_and_validate(provider, question, catalog, dialect, config, trace):
-    correction = None
-    schema_text = catalog.to_text()
-    attempts = config.max_correction_attempts + 1
-    validation = None
-    for attempt in range(1, attempts + 1):
-        try:
-            sql = provider.draft_sql(question, schema_text, dialect, correction)
-        except UnsupportedQuestionError as exc:
-            trace.record("draft_failed", attempt=attempt, error=str(exc))
-            return str(exc), None
-
-        trace.record("draft", attempt=attempt, sql=sql)
-        validation = validate_query(
-            sql,
-            table_allowlist=catalog.table_names,
-            dialect=dialect,
-            default_row_limit=config.default_row_limit,
-        )
-        trace.record(
-            "validation",
-            attempt=attempt,
-            is_valid=validation.is_valid,
-            errors=list(validation.errors),
-        )
-        if validation.is_valid:
-            return sql, validation
-        correction = CorrectionContext(previous_sql=sql, error_message="; ".join(validation.errors))
-
-    return sql, validation
 
 
 def _build_catalog(warehouse_dir: Path) -> SchemaCatalog:
