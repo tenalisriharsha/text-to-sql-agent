@@ -41,6 +41,45 @@ def test_inspect_schema_prints_table_and_column_names(warehouse_dir: Path):
     assert "customer_id" in result.output
 
 
+def test_retrieve_ranks_every_table_with_a_score(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["retrieve", "how many customers", "--warehouse-dir", str(warehouse_dir)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ranked tables:" in result.output
+    assert "customers" in result.output
+    assert "orders" in result.output
+    assert "events" in result.output
+    assert "retrieved schema context:" in result.output
+
+
+def test_retrieve_top_k_tables_narrows_the_printed_schema_context(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "retrieve",
+            "how many customers",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--top-k-tables",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # the ranked-tables listing still shows every table...
+    assert result.output.count("customers") >= 1
+    assert result.output.count("orders") >= 1
+    # ...but the narrowed schema context section keeps only the top match.
+    context_section = result.output.split("retrieved schema context:")[1]
+    assert "customers" in context_section
+    assert "orders" not in context_section
+    assert "events" not in context_section
+
+
 def test_validate_accepts_a_safe_query(warehouse_dir: Path):
     runner = CliRunner()
     result = runner.invoke(
@@ -101,6 +140,100 @@ def test_ask_with_yes_executes_and_prints_results(warehouse_dir: Path):
     assert "SQL:" in result.output
     assert "customer_count" in result.output
     assert "200" in result.output
+
+
+def test_ask_window_function_question_runs_end_to_end(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["ask", "running total of revenue", "--warehouse-dir", str(warehouse_dir), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "running_total" in result.output
+
+
+def test_ask_time_filter_question_runs_end_to_end(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["ask", "orders in the last 7 days", "--warehouse-dir", str(warehouse_dir), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SQL:" in result.output
+
+
+def test_ask_events_join_question_runs_end_to_end(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["ask", "events per customer", "--warehouse-dir", str(warehouse_dir), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "event_count" in result.output
+
+
+def test_ask_top_k_tables_narrows_retrieved_tables_in_the_audit_trace(
+    warehouse_dir: Path, tmp_path: Path
+):
+    audit_log = tmp_path / "trace.jsonl"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "how many customers",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--top-k-tables",
+            "1",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    steps = AuditTrace.load(audit_log)
+    schema_step = next(step for step in steps if step["step_type"] == "schema_retrieved")
+    assert set(schema_step["payload"]["tables"]) == {"customers", "orders", "events"}
+    assert schema_step["payload"]["retrieved_tables"] == ["customers"]
+
+
+def test_ask_top_k_tables_narrowing_the_provider_context_does_not_narrow_the_allowlist(
+    warehouse_dir: Path, tmp_path: Path
+):
+    """"order details" ranks only "orders" into the top-1 retrieved table
+    (customers scores zero against that question), yet its scripted SQL
+    joins orders with customers. Validation must still pass: the
+    validator's allowlist is always the full catalog, independent of
+    whatever subset of tables retrieval narrowed the provider's context to.
+    """
+    audit_log = tmp_path / "trace.jsonl"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "order details",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--top-k-tables",
+            "1",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    steps = AuditTrace.load(audit_log)
+    schema_step = next(step for step in steps if step["step_type"] == "schema_retrieved")
+    assert schema_step["payload"]["retrieved_tables"] == ["orders"]
+    validation_step = next(step for step in steps if step["step_type"] == "validation")
+    assert validation_step["payload"]["is_valid"] is True
 
 
 def test_ask_records_a_full_audit_trace_in_order(warehouse_dir: Path, tmp_path: Path):
