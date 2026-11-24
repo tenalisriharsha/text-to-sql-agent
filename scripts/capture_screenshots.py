@@ -135,6 +135,21 @@ SCENES = [
             "grep -v '\"step_type\": \"explain\"' trace.jsonl",
         ],
     ),
+    Scene(
+        filename="07-retrieve.png",
+        title="text-to-sql-agent — retrieve: schema retrieval for a question",
+        commands=[
+            'text-to-sql-agent retrieve "events per customer" --top-k-tables 2 --top-k-columns 3',
+        ],
+    ),
+    Scene(
+        filename="08-advanced-queries.png",
+        title="text-to-sql-agent — window functions and time filters",
+        commands=[
+            'text-to-sql-agent ask "running total of revenue" --yes --row-limit 6',
+            'text-to-sql-agent ask "recent orders" --yes --row-limit 5',
+        ],
+    ),
 ]
 
 
