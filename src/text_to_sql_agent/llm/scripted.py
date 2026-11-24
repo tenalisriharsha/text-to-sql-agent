@@ -87,6 +87,41 @@ _RULES: tuple[_Rule, ...] = (
             "ORDER BY o.order_date DESC"
         ),
     ),
+    _Rule(
+        name="average_order_value",
+        keywords=("average order value", "average order amount"),
+        sql=(
+            "SELECT AVG(total_amount) AS average_order_value FROM orders "
+            "WHERE status = 'completed'"
+        ),
+    ),
+    _Rule(
+        name="recent_orders",
+        keywords=("orders in the last 7 days", "orders from the last week", "recent orders"),
+        sql=(
+            "SELECT order_id, customer_id, order_date, total_amount FROM orders "
+            "WHERE order_date >= CURRENT_DATE - INTERVAL 7 DAY "
+            "ORDER BY order_date DESC"
+        ),
+    ),
+    _Rule(
+        name="running_revenue_total",
+        keywords=("running total of revenue", "cumulative revenue", "running total"),
+        sql=(
+            "SELECT order_date, "
+            "SUM(total_amount) OVER (ORDER BY order_date) AS running_total "
+            "FROM orders WHERE status = 'completed' ORDER BY order_date"
+        ),
+    ),
+    _Rule(
+        name="events_per_customer",
+        keywords=("events per customer", "event count by customer", "events by customer"),
+        sql=(
+            "SELECT c.customer_id, c.name, COUNT(e.event_id) AS event_count FROM customers c "
+            "LEFT JOIN events e ON c.customer_id = e.customer_id "
+            "GROUP BY c.customer_id, c.name ORDER BY event_count DESC"
+        ),
+    ),
 )
 
 
