@@ -77,6 +77,10 @@ def test_budget_config_defaults_are_internally_consistent():
         {"max_correction_attempts": -1},
         {"default_row_limit": 0},
         {"default_row_limit": -5},
+        {"retrieval_top_k_tables": 0},
+        {"retrieval_top_k_tables": -1},
+        {"retrieval_top_k_columns_per_table": 0},
+        {"retrieval_top_k_columns_per_table": -1},
     ],
 )
 def test_agent_config_rejects_invalid_values(kwargs):
@@ -90,3 +94,18 @@ def test_agent_config_defaults_match_documented_values():
     assert config.default_row_limit == 1000
     assert config.require_human_approval is True
     assert isinstance(config.budget, BudgetConfig)
+    # README: "defaults: top 2 tables, every column kept"
+    assert config.retrieval_top_k_tables == 2
+    assert config.retrieval_top_k_columns_per_table is None
+
+
+def test_agent_config_allows_none_retrieval_top_k_to_mean_keep_all():
+    config = AgentConfig(retrieval_top_k_tables=None, retrieval_top_k_columns_per_table=None)
+    assert config.retrieval_top_k_tables is None
+    assert config.retrieval_top_k_columns_per_table is None
+
+
+def test_agent_config_accepts_positive_retrieval_top_k_values():
+    config = AgentConfig(retrieval_top_k_tables=1, retrieval_top_k_columns_per_table=3)
+    assert config.retrieval_top_k_tables == 1
+    assert config.retrieval_top_k_columns_per_table == 3

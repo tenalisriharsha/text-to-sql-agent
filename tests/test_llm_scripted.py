@@ -42,6 +42,17 @@ def test_scripted_provider_is_an_llm_provider():
         "events per type",
         "orders with customer names",
         "give me order details",
+        "average order value",
+        "average order amount",
+        "orders in the last 7 days",
+        "orders from the last week",
+        "recent orders",
+        "running total of revenue",
+        "cumulative revenue",
+        "running total",
+        "events per customer",
+        "event count by customer",
+        "events by customer",
     ],
 )
 def test_recognized_questions_draft_sql_that_passes_validation(question: str):
@@ -79,3 +90,36 @@ def test_join_question_actually_joins_customers_and_orders():
     result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
     assert result.is_valid
     assert set(result.referenced_tables) == {"customers", "orders"}
+
+
+def test_average_order_value_question_drafts_an_aggregate():
+    provider = ScriptedProvider()
+    sql = provider.draft_sql("average order value", "")
+    assert "AVG(" in sql.upper()
+    result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
+    assert result.is_valid, result.errors
+
+
+def test_recent_orders_question_drafts_a_relative_date_time_filter():
+    provider = ScriptedProvider()
+    sql = provider.draft_sql("orders in the last 7 days", "")
+    assert "CURRENT_DATE" in sql.upper()
+    assert "INTERVAL" in sql.upper()
+    result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
+    assert result.is_valid, result.errors
+
+
+def test_running_total_question_drafts_a_window_function():
+    provider = ScriptedProvider()
+    sql = provider.draft_sql("running total of revenue", "")
+    assert "OVER" in sql.upper()
+    result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
+    assert result.is_valid, result.errors
+
+
+def test_events_per_customer_question_joins_events_and_customers():
+    provider = ScriptedProvider()
+    sql = provider.draft_sql("events per customer", "")
+    result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
+    assert result.is_valid, result.errors
+    assert set(result.referenced_tables) == {"customers", "events"}
