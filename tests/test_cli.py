@@ -130,6 +130,124 @@ def test_validate_respects_row_limit_option(warehouse_dir: Path):
     assert "LIMIT 7" in result.output
 
 
+def test_estimate_cost_prints_total_bytes_and_usd_estimate(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["estimate-cost", "SELECT * FROM customers", "--warehouse-dir", str(warehouse_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "total:" in result.output
+    assert "bytes" in result.output
+    assert "athena pricing" in result.output
+    assert "customers:" in result.output
+    assert "columns: all" in result.output
+
+
+def test_estimate_cost_rejects_invalid_sql_without_printing_an_estimate(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["estimate-cost", "DELETE FROM orders", "--warehouse-dir", str(warehouse_dir)],
+    )
+
+    assert result.exit_code == 1
+    assert "REJECTED" in result.output
+    assert "total:" not in result.output
+
+
+def test_estimate_cost_rejects_a_disallowed_table(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["estimate-cost", "SELECT * FROM secret_table", "--warehouse-dir", str(warehouse_dir)],
+    )
+
+    assert result.exit_code == 1
+    assert "REJECTED" in result.output
+
+
+def test_estimate_cost_narrow_projection_lists_specific_columns_not_all(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "estimate-cost",
+            "SELECT o.order_id, c.name FROM orders o JOIN customers c "
+            "ON o.customer_id = c.customer_id",
+            "--warehouse-dir",
+            str(warehouse_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "columns: all" not in result.output
+    assert "order_id" in result.output
+    assert "name" in result.output
+
+
+def test_estimate_cost_partition_filter_narrows_partitions_scanned(warehouse_dir: Path):
+    import datetime
+
+    today = datetime.date.today().isoformat()
+    runner = CliRunner()
+
+    unfiltered = runner.invoke(
+        main,
+        ["estimate-cost", "SELECT * FROM events", "--warehouse-dir", str(warehouse_dir)],
+    )
+    filtered = runner.invoke(
+        main,
+        [
+            "estimate-cost",
+            f"SELECT * FROM events WHERE event_date = '{today}'",
+            "--warehouse-dir",
+            str(warehouse_dir),
+        ],
+    )
+
+    assert unfiltered.exit_code == 0, unfiltered.output
+    assert filtered.exit_code == 0, filtered.output
+    assert "partitions scanned: 30" in unfiltered.output
+    assert "partitions scanned: 1" in filtered.output
+
+
+def test_estimate_cost_pricing_model_option_changes_the_dollar_estimate(warehouse_dir: Path):
+    runner = CliRunner()
+    athena = runner.invoke(
+        main,
+        [
+            "estimate-cost",
+            "SELECT * FROM orders",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--pricing-model",
+            "athena",
+        ],
+    )
+    bigquery = runner.invoke(
+        main,
+        [
+            "estimate-cost",
+            "SELECT * FROM orders",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--pricing-model",
+            "bigquery",
+        ],
+    )
+
+    assert athena.exit_code == 0, athena.output
+    assert bigquery.exit_code == 0, bigquery.output
+    assert "athena pricing" in athena.output
+    assert "bigquery pricing" in bigquery.output
+    # same bytes scanned, but bigquery's $6.25/TiB costs more than athena's $5/TiB.
+    athena_cost = float(athena.output.split("~$")[1].split(",")[0])
+    bigquery_cost = float(bigquery.output.split("~$")[1].split(",")[0])
+    assert bigquery_cost > athena_cost
+
+
 def test_ask_with_yes_executes_and_prints_results(warehouse_dir: Path):
     runner = CliRunner()
     result = runner.invoke(
@@ -270,6 +388,88 @@ def test_ask_records_a_full_audit_trace_in_order(warehouse_dir: Path, tmp_path: 
     final = steps[-1]
     assert final["payload"]["outcome"] == "executed"
     assert final["payload"]["row_count"] == 1
+
+    cost_step = next(step for step in steps if step["step_type"] == "cost_estimate")
+    assert cost_step["payload"]["pricing_model"] == "athena"
+    assert "customers" in cost_step["payload"]["per_table"]
+    assert cost_step["payload"]["per_table"]["customers"]["bytes_scanned"] > 0
+
+
+def test_ask_max_bytes_scanned_refuses_to_run_and_does_not_execute(
+    warehouse_dir: Path, tmp_path: Path
+):
+    """PROGRESS.md: `ask --max-bytes-scanned 10` must correctly refuse to run."""
+    audit_log = tmp_path / "trace.jsonl"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "how many customers",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--max-bytes-scanned",
+            "10",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "refusing to run" in result.output.lower()
+
+    steps = AuditTrace.load(audit_log)
+    step_types = [step["step_type"] for step in steps]
+    assert "execution_result" not in step_types
+    assert step_types[-1] == "final"
+    assert steps[-1]["payload"]["outcome"] == "budget_exceeded"
+
+
+def test_ask_max_cost_usd_refuses_to_run_and_does_not_execute(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "how many customers",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--max-cost-usd",
+            "0.0000001",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "refusing to run" in result.output.lower()
+    assert "customer_count" not in result.output
+
+
+def test_ask_pricing_model_option_is_recorded_in_the_audit_trace(
+    warehouse_dir: Path, tmp_path: Path
+):
+    audit_log = tmp_path / "trace.jsonl"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "how many customers",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--pricing-model",
+            "bigquery",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    steps = AuditTrace.load(audit_log)
+    cost_step = next(step for step in steps if step["step_type"] == "cost_estimate")
+    assert cost_step["payload"]["pricing_model"] == "bigquery"
 
 
 def test_ask_unsupported_question_fails_without_executing_anything(warehouse_dir: Path):
