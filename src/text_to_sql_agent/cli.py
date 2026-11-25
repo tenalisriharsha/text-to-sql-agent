@@ -9,8 +9,8 @@ through the full draft/validate/correct/approve/execute loop. Everything
 
 from __future__ import annotations
 
-import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -18,7 +18,8 @@ import duckdb
 
 from text_to_sql_agent.agent import run_agent_loop
 from text_to_sql_agent.audit import AuditTrace
-from text_to_sql_agent.config import AgentConfig
+from text_to_sql_agent.config import AgentConfig, BudgetConfig, pricing_model_for
+from text_to_sql_agent.cost_estimate import TableLocation, estimate_bytes_scanned
 from text_to_sql_agent.llm.scripted import ScriptedProvider
 from text_to_sql_agent.retrieval import SchemaRetriever
 from text_to_sql_agent.schema_catalog import SchemaCatalog
@@ -146,6 +147,66 @@ def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None)
         sys.exit(1)
 
 
+@main.command("estimate-cost")
+@click.argument("sql")
+@click.option(
+    "--warehouse-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=DEFAULT_WAREHOUSE_DIR,
+    show_default=True,
+)
+@click.option("--dialect", type=click.Choice(["duckdb"]), default="duckdb", show_default=True)
+@click.option("--row-limit", type=int, default=None)
+@click.option(
+    "--pricing-model",
+    type=click.Choice(["athena", "bigquery"]),
+    default="athena",
+    show_default=True,
+)
+def estimate_cost(
+    sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None, pricing_model: str
+) -> None:
+    """Validate SQL, then show its partition/column-pruning-aware scan estimate.
+
+    This is the scan-cost guard `ask` runs internally before execution,
+    exposed directly: SQL is validated first (same safety contract as
+    `validate`), then the normalized query is sized against the sample
+    warehouse on disk -- restricting `events` to the partitions its WHERE
+    clause actually allows, and restricting every table to the columns its
+    SELECT list, WHERE clause, GROUP BY, and ORDER BY actually reference.
+    """
+    catalog = _build_catalog(warehouse_dir)
+    default_row_limit = row_limit if row_limit is not None else AgentConfig().default_row_limit
+    result = validate_query(
+        sql,
+        table_allowlist=catalog.table_names,
+        dialect=dialect,
+        default_row_limit=default_row_limit,
+    )
+    if not result.is_valid:
+        click.echo("REJECTED")
+        for error in result.errors:
+            click.echo(f"  - {error}")
+        sys.exit(1)
+
+    assert result.normalized_sql is not None
+    scan = estimate_bytes_scanned(result.normalized_sql, dialect, _table_locations(warehouse_dir))
+    cost = pricing_model_for(pricing_model).estimate_cost_usd(scan.total_bytes)
+
+    click.echo(f"total: {scan.total_bytes} bytes (~${cost:.6f}, {pricing_model} pricing)")
+    for table, estimate in sorted(scan.per_table.items()):
+        click.echo(f"\n  {table}: {estimate.bytes_scanned} bytes")
+        if estimate.all_columns:
+            click.echo("    columns: all")
+        else:
+            click.echo(f"    columns: {', '.join(estimate.columns_scanned) or '(none referenced)'}")
+        if estimate.partitions_scanned is not None:
+            click.echo(
+                f"    partitions scanned: {len(estimate.partitions_scanned)} "
+                f"({', '.join(estimate.partitions_scanned) or 'none'})"
+            )
+
+
 @main.command("ask")
 @click.argument("question")
 @click.option(
@@ -189,6 +250,24 @@ def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None)
     default=None,
     help="Retrieval: within each kept table, keep only the top-k ranked columns.",
 )
+@click.option(
+    "--pricing-model",
+    type=click.Choice(["athena", "bigquery"]),
+    default=None,
+    help="Scan-cost pricing model. Default: athena.",
+)
+@click.option(
+    "--max-bytes-scanned",
+    type=int,
+    default=None,
+    help="Hard ceiling on estimated bytes scanned; above it, ask refuses to run.",
+)
+@click.option(
+    "--max-cost-usd",
+    type=float,
+    default=None,
+    help="Hard ceiling on estimated cost in USD; above it, ask refuses to run.",
+)
 def ask(
     question: str,
     warehouse_dir: Path,
@@ -200,9 +279,17 @@ def ask(
     row_limit: int | None,
     top_k_tables: int | None,
     top_k_columns: int | None,
+    pricing_model: str | None,
+    max_bytes_scanned: int | None,
+    max_cost_usd: float | None,
 ) -> None:
     """Draft, validate, and (after approval) execute SQL for QUESTION."""
     defaults = AgentConfig()
+    budget = BudgetConfig(
+        pricing_model=pricing_model_for(pricing_model) if pricing_model is not None else defaults.budget.pricing_model,
+        max_bytes_scanned=max_bytes_scanned if max_bytes_scanned is not None else defaults.budget.max_bytes_scanned,
+        max_cost_usd=max_cost_usd if max_cost_usd is not None else defaults.budget.max_cost_usd,
+    )
     config = AgentConfig(
         max_correction_attempts=max_correction_attempts
         if max_correction_attempts is not None
@@ -212,6 +299,7 @@ def ask(
         retrieval_top_k_columns_per_table=top_k_columns
         if top_k_columns is not None
         else defaults.retrieval_top_k_columns_per_table,
+        budget=budget,
     )
 
     trace = AuditTrace(audit_log)
@@ -269,13 +357,15 @@ def ask(
         trace.record("final", outcome="translated", dialect=target_dialect, sql=final_sql)
         return
 
-    bytes_estimate = _estimate_bytes_scanned(warehouse_dir, validation.referenced_tables)
+    scan = estimate_bytes_scanned(final_sql, dialect, _table_locations(warehouse_dir))
+    bytes_estimate = scan.total_bytes
     cost_estimate = config.budget.estimate_cost_usd(bytes_estimate)
     trace.record(
         "cost_estimate",
         bytes_scanned=bytes_estimate,
         cost_usd=round(cost_estimate, 6),
         pricing_model=config.budget.pricing_model.name,
+        per_table={name: asdict(estimate) for name, estimate in scan.per_table.items()},
     )
 
     if bytes_estimate > config.budget.max_bytes_scanned or cost_estimate > config.budget.max_cost_usd:
@@ -336,24 +426,15 @@ def _warehouse_info(warehouse_dir: Path):
     )
 
 
-def _estimate_bytes_scanned(warehouse_dir: Path, referenced_tables: tuple[str, ...]) -> int:
-    """Naive bytes-scanned estimate: file sizes of every referenced table's data.
-
-    This ignores partition and column pruning; a pruning-aware estimate is a
-    later phase's scan-cost guard. It is enough for a hard-budget sanity check.
-    """
-    total = 0
+def _table_locations(warehouse_dir: Path) -> dict[str, TableLocation]:
     info = _warehouse_info(warehouse_dir)
-    for table in referenced_tables:
-        if table == "customers":
-            total += info.customers_path.stat().st_size
-        elif table == "orders":
-            total += info.orders_path.stat().st_size
-        elif table == "events":
-            for root, _dirs, files in os.walk(info.events_root):
-                for name in files:
-                    total += (Path(root) / name).stat().st_size
-    return total
+    return {
+        "customers": TableLocation(path=info.customers_path),
+        "orders": TableLocation(path=info.orders_path),
+        "events": TableLocation(
+            path=info.events_root, partition_column=PARTITION_COLUMNS["events"][0]
+        ),
+    }
 
 
 if __name__ == "__main__":
