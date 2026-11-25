@@ -88,11 +88,12 @@ src/text_to_sql_agent/
   schema_catalog.py  ColumnSchema, TableSchema, SchemaCatalog (+ DuckDB introspection)
   retrieval.py        SchemaRetriever (TF-IDF table/column ranking and narrowing)
   agent.py           run_agent_loop: draft/validate/EXPLAIN/retry, independent of the CLI
+  cost_estimate.py   estimate_bytes_scanned: partition- and column-pruning-aware scan-cost estimate
   warehouse/         generate.py (sample Parquet warehouse), load.py (register as DuckDB views)
   llm/               base.py (LLMProvider ABC, CorrectionContext), scripted.py (deterministic provider)
   sql/               validator.py (sqlglot-based validation + LIMIT enforcement), dialect.py (Athena/BigQuery translation)
   audit.py           AuditTrace (JSON Lines trace writer/reader)
-  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|retrieve|validate|ask`
+  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|retrieve|validate|estimate-cost|ask`
 ```
 
 ## Build plan
@@ -150,13 +151,50 @@ src/text_to_sql_agent/
       disambiguation logic, not more canned SQL, so they're left to the
       Phase 5 benchmark design.
 
-### Phase 3 — Scan-cost guard for real
-- [ ] Partition-pruning-aware bytes-scanned estimate (read the query's
-      `WHERE` clause against `events`' partition columns) instead of the
-      current naive "sum of file sizes" placeholder.
-- [ ] Column-pruning-aware estimate (Parquet column statistics).
-- [ ] Wire `BudgetConfig`/`PricingModel` selection into the CLI (currently
-      only the Python API exposes it).
+### Phase 3 — Scan-cost guard for real (complete)
+- [x] `cost_estimate.py`: `estimate_bytes_scanned`, a partition- and
+      column-pruning-aware replacement for the old "sum of every
+      referenced table's on-disk file size" placeholder. It parses the
+      *validated* SQL with `sqlglot` (independent of the validator's own
+      parse) to: (a) extract equality/`IN`/range predicates on `events`'
+      `event_date` partition column and restrict the scan to the matching
+      `event_date=...` directories, resolving qualified/unqualified
+      columns through a table-alias map built from the query's own
+      `FROM`/`JOIN` clauses; (b) extract which columns each table's
+      `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY` actually reference and sum
+      just those columns' `total_compressed_size` from each Parquet
+      file's row-group metadata (`pyarrow.parquet.ParquetFile.metadata`)
+      instead of the whole file.
+- [x] Both prunings fail safe by design: a bare `*` (including `COUNT(*)`
+      — its `Star` isn't a plain projection but the same fallback keeps it
+      simple), an ambiguous unqualified column in a multi-table query, an
+      `OR`-combined predicate, or a predicate the extractor doesn't
+      recognize (e.g. `CURRENT_DATE - INTERVAL`, which can't be evaluated
+      without executing it) all fall back to charging for *more* bytes
+      (every partition, every column) rather than guessing lower. A
+      referenced column absent from a file's physical schema — this is
+      how `event_date` itself behaves, since hive partitioning keeps it
+      only in the directory name, never in the Parquet file — falls back
+      to that file's full size the same way.
+- [x] New `estimate-cost SQL` CLI command: validates `SQL` (same contract
+      as `validate`) and prints the resulting per-table byte/column/
+      partition breakdown plus a USD estimate, independent of asking a
+      full question — this is what exercises the module directly and was
+      used to confirm partition pruning (30 partitions -> 1 for an
+      `event_date = '...'` filter) and column pruning (a 2-column join
+      projection costing a fraction of each table's full size) against
+      the real sample warehouse (see commit history and
+      `docs/screenshots/09-cost-guard.png`).
+- [x] `ask` now calls the same `estimate_bytes_scanned` instead of the old
+      placeholder, and records the per-table breakdown in the audit trace
+      (`cost_estimate` step's new `per_table` field).
+- [x] `BudgetConfig`/`PricingModel` selection wired into the CLI: `ask`
+      and `estimate-cost` both take `--pricing-model athena|bigquery`,
+      and `ask` additionally takes `--max-bytes-scanned`/`--max-cost-usd`
+      to override the default hard ceilings per run (`confirm_above_usd`
+      remains Python-API-only, as documented in the README — the CLI's
+      approval gate always prompts unless `--yes`, independent of that
+      threshold).
 
 ### Phase 4 — Multi-dialect execution
 - [ ] Execution adapters for Athena (Trino) and BigQuery behind the same
@@ -178,31 +216,34 @@ src/text_to_sql_agent/
 
 ## Resume point
 
-Phases 1 and 2 are implemented, installed in editable mode, and have been
-run by hand end to end: `init-warehouse`, `inspect-schema`, the new
-`retrieve` command (ranking and top-k narrowing against a live question),
-`validate`, and `ask` across the broadened `ScriptedProvider` rule set
-(count, average, time filter, window function, two joins), dialect
-translation to Athena/BigQuery, and the audit trace. The engine-error
-retry path was exercised directly against `agent.run_agent_loop` with a
-custom `LLMProvider` that drafts a query referencing a nonexistent column:
-it correctly produces three `engine_error` trace steps (bounded by
-`max_correction_attempts`) and a final `validation.errors` message quoting
-DuckDB's own binder error. The full test suite (112 tests, pre-existing --
-a fresh test pass against this update is expected to land more) passes
-unchanged.
+Phases 1, 2, and 3 are implemented, installed in editable mode, and have
+been run by hand end to end against the real sample warehouse: every CLI
+command (`init-warehouse`, `inspect-schema`, `retrieve`, `validate`,
+`estimate-cost`, `ask`), the broadened `ScriptedProvider` rule set,
+dialect translation to Athena/BigQuery, and the audit trace. The new
+`estimate_bytes_scanned` was verified directly: `SELECT * FROM events`
+scans all 30 partitions at full column width; adding
+`WHERE event_date = '<today>'` narrows it to 1 partition; a qualified
+two-column join projection (`orders o JOIN customers c`, selecting
+`o.order_id, c.name`) costs a fraction of each table's full size; an
+`OR`-combined partition predicate and an ambiguous unqualified column in a
+join both correctly fall back to the conservative (un-pruned) estimate.
+`ask --max-bytes-scanned 10` correctly refuses to run. The full test
+suite (163 tests, pre-existing -- a fresh test pass against this update is
+expected to land more) passes unchanged.
 
-Pick up at **Phase 3** — scan-cost guard for real: today's
-`_estimate_bytes_scanned` in `cli.py` is a naive "sum of every referenced
-table's on-disk file size" placeholder that ignores both partition pruning
-(a `WHERE event_date = ...` filter on `events` still charges for every
-partition) and column pruning (a `SELECT one_column` still charges for the
-whole table). Start by parsing the validated query's `WHERE` clause
-against `events`' partition column (`event_date`) using sqlglot, restrict
-the file-walk to matching partition directories, and compare against
-Parquet column statistics (`pyarrow.parquet.ParquetFile.metadata`) for
-column-level pruning. Then wire `BudgetConfig`/`PricingModel` selection
-into the CLI (currently only the Python API exposes it -- `ask` always
-uses the `AgentConfig` default budget).
+Pick up at **Phase 4** — multi-dialect execution: today only DuckDB
+executes (`ask`'s `--dialect` choice is `duckdb`-only; `--target-dialect`
+only *prints* translated SQL for Athena/BigQuery, it never runs it).
+Add execution adapters for Athena (Trino) and BigQuery behind the same
+interface DuckDB's `connection.execute`/`EXPLAIN` provide today (likely a
+small `Connection` protocol in a new `engines/` package, with DuckDB's
+native connection as the first implementation and Trino/BigQuery clients
+as the other two -- `pyathena`/`google-cloud-bigquery` are the obvious
+library choices, both optional extras so the no-API-key default install
+stays dependency-light). Once non-DuckDB execution is real, make
+non-demo-source approval mandatory and unbypassable by `--yes` (today
+`--yes` applies uniformly because only DuckDB executes, which is also
+the only source this project calls "demo").
 
 STATUS: IN_PROGRESS
