@@ -7,6 +7,7 @@ Playwright. Nothing here hand-writes or edits command output.
 
 from __future__ import annotations
 
+import datetime
 import html
 import os
 import shutil
@@ -153,6 +154,21 @@ SCENES = [
 ]
 
 
+def _cost_guard_scene() -> Scene:
+    """Built at capture time: `events`' partitions are named after today's date."""
+    today = datetime.date.today().isoformat()
+    return Scene(
+        filename="09-cost-guard.png",
+        title="text-to-sql-agent — estimate-cost and the scan-cost guard",
+        commands=[
+            'text-to-sql-agent estimate-cost "SELECT * FROM events"',
+            'text-to-sql-agent estimate-cost "SELECT event_type FROM events WHERE event_date = '
+            f"'{today}'\"",
+            'text-to-sql-agent ask "how many customers" --yes --max-bytes-scanned 10',
+        ],
+    )
+
+
 def run_command(command: str, cwd: Path, env: dict[str, str]) -> Step:
     proc = subprocess.run(
         command,
@@ -195,7 +211,7 @@ def main() -> None:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 960, "height": 100})
 
-        for scene in SCENES:
+        for scene in [*SCENES, _cost_guard_scene()]:
             steps = [run_command(cmd, cwd=work_dir, env=env) for cmd in scene.commands]
             body_html = render_body(steps)
             html_doc = TEMPLATE.format(title=html.escape(scene.title), body=body_html)
