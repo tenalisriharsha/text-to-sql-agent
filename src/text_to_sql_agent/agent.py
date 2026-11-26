@@ -17,6 +17,7 @@ import duckdb
 
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig
+from text_to_sql_agent.engines.base import EngineExecutionError
 from text_to_sql_agent.llm.base import CorrectionContext, LLMProvider
 from text_to_sql_agent.llm.scripted import UnsupportedQuestionError
 from text_to_sql_agent.sql.validator import ValidationResult, validate_query
@@ -55,6 +56,12 @@ def run_agent_loop(
     trace: AuditTrace,
 ) -> AgentResult:
     """Draft, validate, and EXPLAIN-check ``question`` against ``connection``.
+
+    ``connection`` only needs to support ``.execute(sql)`` returning an
+    object with ``.fetchall()`` -- DuckDB's native connection satisfies
+    this directly; the Athena and BigQuery adapters in ``engines/`` wrap
+    their own drivers to satisfy it too, so this loop works unmodified
+    against any of the three (see ``engines.base.Connection``).
 
     ``table_allowlist`` is the full catalog's table names, independent of
     whatever subset of the catalog ``schema_context`` was narrowed to by
@@ -96,7 +103,7 @@ def run_agent_loop(
         assert validation.normalized_sql is not None
         try:
             plan_rows = connection.execute(f"EXPLAIN {validation.normalized_sql}").fetchall()
-        except duckdb.Error as exc:
+        except (duckdb.Error, EngineExecutionError) as exc:
             engine_error = str(exc)
             trace.record("engine_error", attempt=attempt, error=engine_error)
             validation = ValidationResult.failure(f"engine rejected query: {engine_error}")
