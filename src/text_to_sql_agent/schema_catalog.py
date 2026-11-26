@@ -145,6 +145,6 @@ def _sample_values(
     quoted_column = f'"{column_name}"'
     rows = connection.execute(
         f"select distinct {quoted_column} from {quoted_table}"
-        f" where {quoted_column} is not null limit {limit}"
+        f" where {quoted_column} is not null order by {quoted_column} limit {limit}"
     ).fetchall()
     return tuple(str(row[0]) for row in rows)
