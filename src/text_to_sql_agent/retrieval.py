@@ -67,9 +67,13 @@ def _vector(tokens: list[str], idf: dict[str, float]) -> Vector:
 def _cosine(a: Vector, b: Vector) -> float:
     if not a or not b:
         return 0.0
-    common = a.keys() & b.keys()
+    common = sorted(a.keys() & b.keys())
     if not common:
         return 0.0
+    # Sum over a sorted key order, not the set intersection's hash-bucket
+    # order: floating-point addition isn't associative, so an
+    # unordered/hash-seed-dependent summation order can flip the score
+    # comparison between two near-tied tables from one run to the next.
     numerator = sum(a[term] * b[term] for term in common)
     norm_a = math.sqrt(sum(value * value for value in a.values()))
     norm_b = math.sqrt(sum(value * value for value in b.values()))
