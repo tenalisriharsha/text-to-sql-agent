@@ -21,8 +21,11 @@ question, it:
    human approval step before anything executes against a non-demo source.
 
 It runs end to end on DuckDB against a generated sample warehouse
-(`orders`, `customers`, `events`, with `events` partitioned Parquet), and
-can emit Athena (Trino) or BigQuery dialect through `sqlglot`. An
+(`orders`, `customers`, `events`, with `events` partitioned Parquet), can
+emit Athena (Trino) or BigQuery dialect through `sqlglot`, and -- given
+connection details for an account of your own -- can draft, `EXPLAIN`,
+and execute against real Athena or BigQuery through the adapters in
+`engines/`. An
 evaluation harness scores a benchmark of 40-60 questions of rising
 difficulty (joins, aggregates, window functions, time filters, ambiguous
 questions) on execution accuracy, result-set match, steps taken, and cost
@@ -92,6 +95,7 @@ src/text_to_sql_agent/
   warehouse/         generate.py (sample Parquet warehouse), load.py (register as DuckDB views)
   llm/               base.py (LLMProvider ABC, CorrectionContext), scripted.py (deterministic provider)
   sql/               validator.py (sqlglot-based validation + LIMIT enforcement), dialect.py (Athena/BigQuery translation)
+  engines/           base.py (Connection/Cursor protocol, EngineExecutionError), athena_engine.py, bigquery_engine.py
   audit.py           AuditTrace (JSON Lines trace writer/reader)
   cli.py             `text-to-sql-agent init-warehouse|inspect-schema|retrieve|validate|estimate-cost|ask`
 ```
@@ -196,11 +200,89 @@ src/text_to_sql_agent/
       approval gate always prompts unless `--yes`, independent of that
       threshold).
 
-### Phase 4 — Multi-dialect execution
-- [ ] Execution adapters for Athena (Trino) and BigQuery behind the same
-      interface DuckDB uses, gated by the existing human-approval step.
-- [ ] Non-demo-source approval is mandatory and cannot be bypassed with
-      `--yes` (today `--yes` applies uniformly since only DuckDB executes).
+### Phase 4 — Multi-dialect execution (complete)
+- [x] `engines/base.py`: a `Connection`/`Cursor` `Protocol` documenting the
+      narrow interface `run_agent_loop` and `ask` need from whatever they
+      execute against (`.execute(sql)` returning something with
+      `.description`/`.fetchall()`, including the literal string
+      `EXPLAIN <query>`), and `EngineExecutionError`, a normalized
+      exception every adapter raises instead of its driver's own.
+      DuckDB's native connection already satisfies this protocol and is
+      used directly, unwrapped, exactly as it has been since Phase 1.
+- [x] `engines/athena_engine.py`: `AthenaConnection`, a thin wrapper over
+      `pyathena` (optional `athena` extra). Athena speaks Trino SQL and
+      Trino supports a real `EXPLAIN <query>` statement, so this adapter
+      needs no special-casing for it — every statement, `EXPLAIN`
+      included, passes straight through; only the resulting cursor and
+      any driver exception get translated into the shapes
+      `engines.base.Connection`/`EngineExecutionError` describe. Verified
+      directly against the real `pyathena` driver (with the extra
+      installed in a scratch venv and placeholder credentials): a lazy
+      `pyathena.connect()` plus a real `execute()` call correctly surfaces
+      AWS's own `botocore.exceptions.ClientError` wrapped as
+      `EngineExecutionError`, and a missing `pyathena` install raises a
+      clear "install with `pip install text-to-sql-agent[athena]`"
+      message instead of an `ImportError` traceback.
+- [x] `engines/bigquery_engine.py`: `BigQueryConnection`, a thin wrapper
+      over `google-cloud-bigquery` (optional `bigquery` extra). BigQuery
+      has no `EXPLAIN` statement at all — its closest equivalent is a
+      dry-run query job, which validates and prices a query without
+      scanning data or returning rows — so this adapter intercepts the
+      literal `EXPLAIN ` prefix `run_agent_loop`/`ask` issue and runs a
+      dry run instead, reporting `total_bytes_processed` as the plan
+      text; every other statement goes to BigQuery unmodified.
+- [x] `agent.py`: widened `run_agent_loop`'s `except duckdb.Error` to
+      `except (duckdb.Error, EngineExecutionError)` around the `EXPLAIN`
+      call — the loop's `connection` parameter was already duck-typed
+      (just `.execute(sql).fetchall()`), so both adapters work against it
+      completely unmodified; existing callers that still pass a raw
+      DuckDB connection are unaffected.
+- [x] `cli.py`: `ask --dialect` now accepts `duckdb|athena|bigquery` (was
+      `duckdb`-only); `athena`/`bigquery` take `--athena-s3-staging-dir`/
+      `--athena-region`/`--athena-schema`/`--athena-workgroup` or
+      `--bigquery-project`/`--bigquery-location` to build the connection,
+      erroring with a clear `click.UsageError` if a dialect's required
+      option is missing, and with the adapter's own `EngineExecutionError`
+      message (not a traceback) if the optional driver isn't installed or
+      the real engine rejects the query. The schema catalog and table
+      allowlist always come from the local sample warehouse regardless of
+      `--dialect` — `ask`'s retrieval/validation step was never about
+      *where* a query runs, and teaching it to introspect a live Glue
+      Catalog or BigQuery dataset is out of scope here; this means
+      pointing `ask` at Athena/BigQuery assumes that account already has
+      `customers`/`orders`/`events` tables with matching columns.
+- [x] Non-demo-source approval is mandatory and cannot be bypassed with
+      `--yes`: the approval gate now checks `not (yes and dialect ==
+      "duckdb")`, so `--yes` still skips the prompt for the bundled demo
+      source (unchanged, still exercised by the existing CLI tests) but
+      is silently ignored for `athena`/`bigquery`.
+- [x] The scan-cost guard (`estimate_bytes_scanned`) sizes the *local*
+      warehouse's Parquet files on disk, which has no meaning for a query
+      that actually runs against a real Athena/BigQuery account, so `ask`
+      skips it for non-`duckdb` dialects and records a `cost_estimate`
+      audit step with `bytes_scanned`/`cost_usd` set to `None` and a
+      `note` explaining why, instead of a fabricated number. The `EXPLAIN`
+      step (a real dry-run bytes estimate for BigQuery, a plan for
+      Athena) is the cost signal shown to the human approver instead.
+- [x] `validate`/`estimate-cost --dialect` also widened to
+      `duckdb|athena|bigquery` for consistency (sqlglot dialect-aware
+      parsing/rendering only — neither command executes anything).
+- [x] Fixed a pre-existing, unrelated flaky-test bug surfaced while
+      verifying this phase: `SchemaRetriever`'s cosine similarity summed
+      over a raw set intersection (`a.keys() & b.keys()`), whose iteration
+      order is hash-seed-dependent for string keys — floating-point
+      addition isn't associative, so near-tied tables (e.g. "customers"
+      vs. "orders" for a question containing "customers", since both
+      tables' documents contain that token) could flip rank order between
+      runs. `_cosine` now sums over `sorted(...)`. The actual root cause
+      of the observed flakiness was `schema_catalog._sample_values`'s
+      `SELECT DISTINCT ... LIMIT N` with no `ORDER BY`, which DuckDB does
+      not guarantee a stable row order for — different sample values
+      each run meant genuinely different TF-IDF documents, not just
+      summation-order noise. Added `ORDER BY` there too; `pytest
+      tests/test_retrieval.py` run 8x with `PYTHONHASHSEED` varied 1-8
+      confirmed both fixes together eliminate the flake (0/8 failures,
+      versus 2-4/8 before).
 
 ### Phase 5 — Evaluation harness
 - [ ] 40-60 question benchmark, rising difficulty (joins, aggregates,
@@ -216,34 +298,39 @@ src/text_to_sql_agent/
 
 ## Resume point
 
-Phases 1, 2, and 3 are implemented, installed in editable mode, and have
-been run by hand end to end against the real sample warehouse: every CLI
-command (`init-warehouse`, `inspect-schema`, `retrieve`, `validate`,
-`estimate-cost`, `ask`), the broadened `ScriptedProvider` rule set,
-dialect translation to Athena/BigQuery, and the audit trace. The new
-`estimate_bytes_scanned` was verified directly: `SELECT * FROM events`
-scans all 30 partitions at full column width; adding
-`WHERE event_date = '<today>'` narrows it to 1 partition; a qualified
-two-column join projection (`orders o JOIN customers c`, selecting
-`o.order_id, c.name`) costs a fraction of each table's full size; an
-`OR`-combined partition predicate and an ambiguous unqualified column in a
-join both correctly fall back to the conservative (un-pruned) estimate.
-`ask --max-bytes-scanned 10` correctly refuses to run. The full test
-suite (163 tests, pre-existing -- a fresh test pass against this update is
-expected to land more) passes unchanged.
+Phases 1-4 are implemented, installed in editable mode, and have been run
+by hand end to end: every CLI command (`init-warehouse`, `inspect-schema`,
+`retrieve`, `validate`, `estimate-cost`, `ask`) against the real sample
+warehouse, the Athena/BigQuery adapters' error paths (missing required
+CLI options -> `click.UsageError`; optional driver not installed -> a
+clear `EngineExecutionError` message; `pyathena` actually installed in a
+scratch venv and exercised against the real driver with placeholder AWS
+credentials, confirming a real `botocore.exceptions.ClientError` comes
+back wrapped as `EngineExecutionError` rather than an unhandled
+traceback). The full test suite (187 tests, pre-existing plus the
+retrieval-flakiness fix) passes, re-run 5x in a row with no flakes.
 
-Pick up at **Phase 4** — multi-dialect execution: today only DuckDB
-executes (`ask`'s `--dialect` choice is `duckdb`-only; `--target-dialect`
-only *prints* translated SQL for Athena/BigQuery, it never runs it).
-Add execution adapters for Athena (Trino) and BigQuery behind the same
-interface DuckDB's `connection.execute`/`EXPLAIN` provide today (likely a
-small `Connection` protocol in a new `engines/` package, with DuckDB's
-native connection as the first implementation and Trino/BigQuery clients
-as the other two -- `pyathena`/`google-cloud-bigquery` are the obvious
-library choices, both optional extras so the no-API-key default install
-stays dependency-light). Once non-DuckDB execution is real, make
-non-demo-source approval mandatory and unbypassable by `--yes` (today
-`--yes` applies uniformly because only DuckDB executes, which is also
-the only source this project calls "demo").
+Pick up at **Phase 5** — the evaluation harness:
+- A 40-60 question benchmark across the difficulty curve
+  `ScriptedProvider` already spans (counts, aggregates, group-bys, joins,
+  a window function, a time filter) plus ambiguous questions, which
+  nothing currently covers -- these need disambiguation logic in the
+  provider/agent loop, not just more canned SQL, so designing that is
+  part of this phase, not a prerequisite for it.
+- Each benchmark question needs an expected result (or expected
+  rejection, for intentionally-unsafe/unanswerable ones) to score
+  against: execution accuracy (did it run), result-set match (did it
+  return the right rows), steps taken (draft/correction count), and cost
+  per question (reusing `estimate_bytes_scanned`).
+- A `report` CLI command (or `benchmark` subcommand) that runs the suite
+  against the local DuckDB warehouse and prints/writes a summary -- this
+  is the first command that calls `run_agent_loop` many times in a row,
+  so it's also where any remaining rough edges in the retry loop's
+  determinism or audit-trace volume would surface first.
+- Phase 4's adapters are complete but inherently can't be exercised against
+  a *real* Athena/BigQuery account from this environment (no cloud
+  credentials) -- that remains true for whoever picks this up next, too;
+  the manual verification record above (real driver, fake credentials) is
+  the ceiling of what's checkable here, not a gap to close before Phase 6.
 
 STATUS: IN_PROGRESS
