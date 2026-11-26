@@ -23,6 +23,12 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
 ]
+athena = [
+    "pyathena>=3.0.0",
+]
+bigquery = [
+    "google-cloud-bigquery>=3.0.0",
+]
 
 [project.scripts]
 text-to-sql-agent = "text_to_sql_agent.cli:main"

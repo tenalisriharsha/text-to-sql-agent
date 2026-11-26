@@ -5,6 +5,14 @@ prints the catalog built from it, ``validate`` checks a SQL string against
 the safety contract without running it, and ``ask`` runs a question
 through the full draft/validate/correct/approve/execute loop. Everything
 ``ask`` does is written to an audit trace.
+
+``ask --dialect`` chooses where that loop's EXPLAIN and execution steps
+run: ``duckdb`` (the default) against the local sample warehouse, or
+``athena``/``bigquery`` against your own account via the adapters in
+``engines/`` -- the schema catalog and table allowlist always come from
+the local warehouse, so this assumes your account already has tables of
+the same names. Non-``duckdb`` dialects always require interactive
+approval, regardless of ``--yes``.
 """
 
 from __future__ import annotations
@@ -20,6 +28,9 @@ from text_to_sql_agent.agent import run_agent_loop
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig, BudgetConfig, pricing_model_for
 from text_to_sql_agent.cost_estimate import TableLocation, estimate_bytes_scanned
+from text_to_sql_agent.engines.athena_engine import AthenaConfig, AthenaConnection
+from text_to_sql_agent.engines.base import EngineExecutionError
+from text_to_sql_agent.engines.bigquery_engine import BigQueryConfig, BigQueryConnection
 from text_to_sql_agent.llm.scripted import ScriptedProvider
 from text_to_sql_agent.retrieval import SchemaRetriever
 from text_to_sql_agent.schema_catalog import SchemaCatalog
@@ -121,7 +132,9 @@ def retrieve(question: str, warehouse_dir: Path, top_k_tables: int | None, top_k
     default=DEFAULT_WAREHOUSE_DIR,
     show_default=True,
 )
-@click.option("--dialect", type=click.Choice(["duckdb"]), default="duckdb", show_default=True)
+@click.option(
+    "--dialect", type=click.Choice(["duckdb", "athena", "bigquery"]), default="duckdb", show_default=True
+)
 @click.option("--row-limit", type=int, default=None)
 def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None) -> None:
     """Check SQL against the safety contract without executing it.
@@ -155,7 +168,9 @@ def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None)
     default=DEFAULT_WAREHOUSE_DIR,
     show_default=True,
 )
-@click.option("--dialect", type=click.Choice(["duckdb"]), default="duckdb", show_default=True)
+@click.option(
+    "--dialect", type=click.Choice(["duckdb", "athena", "bigquery"]), default="duckdb", show_default=True
+)
 @click.option("--row-limit", type=int, default=None)
 @click.option(
     "--pricing-model",
@@ -217,10 +232,16 @@ def estimate_cost(
 )
 @click.option(
     "--dialect",
-    type=click.Choice(["duckdb"]),
+    type=click.Choice(["duckdb", "athena", "bigquery"]),
     default="duckdb",
     show_default=True,
-    help="Execution dialect. Only duckdb executes locally; see --target-dialect to emit SQL for another engine.",
+    help=(
+        "Execution dialect. 'duckdb' runs against the local sample warehouse; "
+        "'athena'/'bigquery' run against your own account (see --athena-* / "
+        "--bigquery-* below) and assume it already has tables matching the "
+        "catalog's names. See --target-dialect to print translated SQL "
+        "without executing anywhere."
+    ),
 )
 @click.option(
     "--target-dialect",
@@ -234,10 +255,39 @@ def estimate_cost(
     "-y",
     is_flag=True,
     default=False,
-    help="Skip the human-approval prompt before executing against the warehouse.",
+    help=(
+        "Skip the human-approval prompt before executing. Only applies to "
+        "--dialect duckdb, the bundled demo source; Athena and BigQuery "
+        "always require interactive approval."
+    ),
 )
 @click.option("--max-correction-attempts", type=int, default=None)
 @click.option("--row-limit", type=int, default=None)
+@click.option(
+    "--athena-s3-staging-dir",
+    default=None,
+    help="Required with --dialect athena: S3 URI Athena stages query results to.",
+)
+@click.option(
+    "--athena-region", default=None, help="Required with --dialect athena: AWS region of the Athena workgroup."
+)
+@click.option(
+    "--athena-schema",
+    default="default",
+    show_default=True,
+    help="Athena/Glue schema (database) to run against.",
+)
+@click.option("--athena-workgroup", default=None, help="Athena workgroup, if your account requires one.")
+@click.option(
+    "--bigquery-project",
+    default=None,
+    help="Required with --dialect bigquery: GCP project to bill and run jobs in.",
+)
+@click.option(
+    "--bigquery-location",
+    default=None,
+    help="BigQuery job location, if your dataset isn't in the default location.",
+)
 @click.option(
     "--top-k-tables",
     type=int,
@@ -277,6 +327,12 @@ def ask(
     yes: bool,
     max_correction_attempts: int | None,
     row_limit: int | None,
+    athena_s3_staging_dir: str | None,
+    athena_region: str | None,
+    athena_schema: str,
+    athena_workgroup: str | None,
+    bigquery_project: str | None,
+    bigquery_location: str | None,
     top_k_tables: int | None,
     top_k_columns: int | None,
     pricing_model: str | None,
@@ -318,8 +374,21 @@ def ask(
         retrieved_tables=list(retrieved_catalog.table_names),
     )
 
-    connection = duckdb.connect()
-    load_into_duckdb(connection, _warehouse_info(warehouse_dir))
+    try:
+        connection = _build_connection(
+            dialect,
+            warehouse_dir,
+            athena_s3_staging_dir,
+            athena_region,
+            athena_schema,
+            athena_workgroup,
+            bigquery_project,
+            bigquery_location,
+        )
+    except EngineExecutionError as exc:
+        click.echo(str(exc), err=True)
+        trace.record("final", outcome="connection_failed", error=str(exc))
+        sys.exit(1)
 
     provider = ScriptedProvider()
     agent_result = run_agent_loop(
@@ -357,29 +426,47 @@ def ask(
         trace.record("final", outcome="translated", dialect=target_dialect, sql=final_sql)
         return
 
-    scan = estimate_bytes_scanned(final_sql, dialect, _table_locations(warehouse_dir))
-    bytes_estimate = scan.total_bytes
-    cost_estimate = config.budget.estimate_cost_usd(bytes_estimate)
-    trace.record(
-        "cost_estimate",
-        bytes_scanned=bytes_estimate,
-        cost_usd=round(cost_estimate, 6),
-        pricing_model=config.budget.pricing_model.name,
-        per_table={name: asdict(estimate) for name, estimate in scan.per_table.items()},
-    )
-
-    if bytes_estimate > config.budget.max_bytes_scanned or cost_estimate > config.budget.max_cost_usd:
-        click.echo(
-            f"refusing to run: estimated cost ${cost_estimate:.4f} "
-            f"({bytes_estimate} bytes) exceeds the configured budget",
-            err=True,
+    demo_source = dialect == "duckdb"
+    if demo_source:
+        scan = estimate_bytes_scanned(final_sql, dialect, _table_locations(warehouse_dir))
+        bytes_estimate = scan.total_bytes
+        cost_estimate = config.budget.estimate_cost_usd(bytes_estimate)
+        trace.record(
+            "cost_estimate",
+            bytes_scanned=bytes_estimate,
+            cost_usd=round(cost_estimate, 6),
+            pricing_model=config.budget.pricing_model.name,
+            per_table={name: asdict(estimate) for name, estimate in scan.per_table.items()},
         )
-        trace.record("final", outcome="budget_exceeded")
-        sys.exit(1)
 
-    click.echo(f"estimated scan: {bytes_estimate} bytes (~${cost_estimate:.4f})")
+        if bytes_estimate > config.budget.max_bytes_scanned or cost_estimate > config.budget.max_cost_usd:
+            click.echo(
+                f"refusing to run: estimated cost ${cost_estimate:.4f} "
+                f"({bytes_estimate} bytes) exceeds the configured budget",
+                err=True,
+            )
+            trace.record("final", outcome="budget_exceeded")
+            sys.exit(1)
 
-    if config.require_human_approval and not yes:
+        click.echo(f"estimated scan: {bytes_estimate} bytes (~${cost_estimate:.4f})")
+    else:
+        # The scan-cost guard sizes the *local* sample warehouse's Parquet
+        # files, which only stands in for a real engine's cost when that
+        # engine is the local demo itself. Against a real Athena/BigQuery
+        # account there is no local file to size, so the guard is skipped
+        # here -- the EXPLAIN plan recorded below is the cost signal
+        # instead (BigQuery's is a dry-run bytes-processed estimate).
+        trace.record(
+            "cost_estimate",
+            bytes_scanned=None,
+            cost_usd=None,
+            pricing_model=config.budget.pricing_model.name,
+            per_table={},
+            note="scan-cost estimation is only available for --dialect duckdb",
+        )
+        click.echo("scan-cost estimate unavailable for this engine; review the EXPLAIN plan before approving.")
+
+    if config.require_human_approval and not (yes and demo_source):
         if not click.confirm("Proceed with execution?", default=False):
             trace.record("final", outcome="rejected_by_user")
             click.echo("aborted.")
@@ -392,9 +479,14 @@ def ask(
 
     trace.record("explain", plan=agent_result.explain_plan)
 
-    result = connection.execute(final_sql)
-    columns = [description[0] for description in result.description]
-    rows = result.fetchall()
+    try:
+        result = connection.execute(final_sql)
+        columns = [description[0] for description in result.description]
+        rows = result.fetchall()
+    except EngineExecutionError as exc:
+        click.echo(f"execution failed: {exc}", err=True)
+        trace.record("final", outcome="execution_failed", error=str(exc))
+        sys.exit(1)
     trace.record("execution_result", row_count=len(rows), columns=columns)
 
     click.echo("\n" + " | ".join(columns))
@@ -402,6 +494,48 @@ def ask(
         click.echo(" | ".join(str(value) for value in row))
 
     trace.record("final", outcome="executed", sql=final_sql, row_count=len(rows))
+
+
+def _build_connection(
+    dialect: str,
+    warehouse_dir: Path,
+    athena_s3_staging_dir: str | None,
+    athena_region: str | None,
+    athena_schema: str,
+    athena_workgroup: str | None,
+    bigquery_project: str | None,
+    bigquery_location: str | None,
+):
+    """Build the connection `ask` drafts/validates/EXPLAINs/executes against.
+
+    `duckdb` loads the local sample warehouse, exactly as every other
+    command does. `athena`/`bigquery` connect to your own account instead
+    -- the schema catalog and table allowlist always come from the local
+    warehouse regardless of dialect, so this assumes your account already
+    has tables named `customers`/`orders`/`events` with matching columns.
+    """
+    if dialect == "duckdb":
+        connection = duckdb.connect()
+        load_into_duckdb(connection, _warehouse_info(warehouse_dir))
+        return connection
+    if dialect == "athena":
+        if not athena_s3_staging_dir or not athena_region:
+            raise click.UsageError(
+                "--dialect athena requires --athena-s3-staging-dir and --athena-region"
+            )
+        return AthenaConnection(
+            AthenaConfig(
+                s3_staging_dir=athena_s3_staging_dir,
+                region_name=athena_region,
+                schema_name=athena_schema,
+                work_group=athena_workgroup,
+            )
+        )
+    if dialect == "bigquery":
+        if not bigquery_project:
+            raise click.UsageError("--dialect bigquery requires --bigquery-project")
+        return BigQueryConnection(BigQueryConfig(project=bigquery_project, location=bigquery_location))
+    raise click.UsageError(f"unsupported dialect '{dialect}'")
 
 
 def _build_catalog(warehouse_dir: Path) -> SchemaCatalog:
