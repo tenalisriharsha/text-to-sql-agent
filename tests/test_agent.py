@@ -15,6 +15,7 @@ import pytest
 from text_to_sql_agent.agent import run_agent_loop
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig
+from text_to_sql_agent.engines.base import EngineExecutionError
 from text_to_sql_agent.llm.base import CorrectionContext, LLMProvider
 from text_to_sql_agent.llm.scripted import ScriptedProvider
 from text_to_sql_agent.warehouse.load import load_into_duckdb
@@ -178,6 +179,40 @@ def test_engine_error_is_caught_inside_the_loop_as_a_retry_not_raised(connection
     # every retry after the first was fed the previous engine error as correction
     assert all(c is not None for c in provider.corrections[1:])
     assert "nonexistent_column" in provider.corrections[1].error_message
+
+
+def test_engine_execution_error_from_a_cloud_adapter_is_caught_as_a_retry(connection):
+    """Phase 4 widened run_agent_loop's `except duckdb.Error` to
+    `except (duckdb.Error, EngineExecutionError)` so the Athena/BigQuery
+    adapters' own normalized exception is treated as a retryable engine
+    error exactly like duckdb's, instead of propagating unhandled past the
+    loop (PROGRESS.md Phase 4)."""
+
+    class _ExplainFailingConnection:
+        def execute(self, sql):
+            raise EngineExecutionError("engine rejected the query")
+
+    trace = AuditTrace()
+    provider = _FixedProvider("SELECT COUNT(*) FROM customers")
+    config = AgentConfig(max_correction_attempts=1)
+
+    result = run_agent_loop(
+        provider,
+        "how many customers",
+        "",
+        TABLE_ALLOWLIST,
+        "athena",
+        _ExplainFailingConnection(),
+        config,
+        trace,
+    )
+
+    assert not result.succeeded
+    assert result.attempts == config.max_correction_attempts + 1
+    engine_error_steps = [step for step in trace.steps if step.step_type == "engine_error"]
+    assert len(engine_error_steps) == config.max_correction_attempts + 1
+    assert result.validation is not None
+    assert "engine rejected the query" in result.validation.errors[0]
 
 
 def test_scripted_provider_repeats_identical_sql_on_every_correction_attempt(connection):
