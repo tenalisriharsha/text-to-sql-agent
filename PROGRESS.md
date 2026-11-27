@@ -49,7 +49,9 @@ SchemaRetriever.retrieve(question)  -- TF-IDF cosine similarity over each
    |                                    the full catalog on an all-zero score)
    v
 LLMProvider.draft_sql(question, schema_context, correction?)
-   |
+   |  -- ambiguous question (no stated metric/window/table) --> ask for
+   |     clarification instead of guessing, no SQL drafted
+   |  -- unrecognized question --> declined as unanswerable
    v
 validate_query()  --sqlglot AST checks--> reject (loop back with error)
    |  (single statement, SELECT-only, table allowlist, LIMIT enforced)
@@ -93,11 +95,12 @@ src/text_to_sql_agent/
   agent.py           run_agent_loop: draft/validate/EXPLAIN/retry, independent of the CLI
   cost_estimate.py   estimate_bytes_scanned: partition- and column-pruning-aware scan-cost estimate
   warehouse/         generate.py (sample Parquet warehouse), load.py (register as DuckDB views)
-  llm/               base.py (LLMProvider ABC, CorrectionContext), scripted.py (deterministic provider)
+  llm/               base.py (LLMProvider ABC, CorrectionContext), scripted.py (deterministic provider; UnsupportedQuestionError, ClarificationNeededError)
   sql/               validator.py (sqlglot-based validation + LIMIT enforcement), dialect.py (Athena/BigQuery translation)
   engines/           base.py (Connection/Cursor protocol, EngineExecutionError), athena_engine.py, bigquery_engine.py
+  evaluation/        benchmark.py (BENCHMARK: 44 scored questions), runner.py (run_benchmark: scores via run_agent_loop)
   audit.py           AuditTrace (JSON Lines trace writer/reader)
-  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|retrieve|validate|estimate-cost|ask`
+  cli.py             `text-to-sql-agent init-warehouse|inspect-schema|retrieve|validate|estimate-cost|benchmark|ask`
 ```
 
 ## Build plan
@@ -284,12 +287,81 @@ src/text_to_sql_agent/
       confirmed both fixes together eliminate the flake (0/8 failures,
       versus 2-4/8 before).
 
-### Phase 5 — Evaluation harness
-- [ ] 40-60 question benchmark, rising difficulty (joins, aggregates,
-      window functions, time filters, ambiguous questions).
-- [ ] Scoring: execution accuracy, result-set match, steps taken, cost per
-      question.
-- [ ] A report command summarizing a benchmark run.
+### Phase 5 — Evaluation harness (complete)
+- [x] Ambiguity detection, the prerequisite the Phase 4 resume point called
+      out as design work rather than more canned SQL:
+      `llm/scripted.py` gains `ClarificationNeededError` (carries the
+      ambiguity itself plus concrete rephrasings that would resolve it)
+      and `_AMBIGUOUS_RULES`, six keyword-matched phrases
+      ("top performers", "recent activity", "how is the business doing",
+      "last month's numbers", "customer activity summary", "our growth")
+      that are recognizable but genuinely under-specified -- no stated
+      metric, time window, or table -- checked *before* `_RULES` so
+      `draft_sql` refuses to guess one interpretation rather than
+      silently answering a different question than the one asked.
+      `agent.AgentResult` gains a `needs_clarification` field (distinct
+      from `draft_error`, which stays for "no rule matches at all"), and
+      `run_agent_loop` catches `ClarificationNeededError` the same way it
+      already caught `UnsupportedQuestionError` -- no retry, immediate
+      return. `ask` prints "question is ambiguous: ..." and exits 1.
+- [x] `evaluation/benchmark.py`: `BenchmarkQuestion` (id, question,
+      category, difficulty 1-5, `expected_outcome` of `"success"` /
+      `"clarification"` / `"unanswerable"`, and -- only for `"success"`
+      -- its own `expected_sql`, authored independently of
+      `ScriptedProvider` rather than copied from it, so scoring checks
+      the agent's answer against a ground truth instead of against
+      itself) and `BENCHMARK`, 44 questions: 32 "success" questions
+      across every `ScriptedProvider` rule and (for rules with more than
+      one keyword) every keyword phrasing -- counts, aggregates,
+      group-bys, two kinds of join, a top-N ranking, a relative-date
+      time filter, a window function -- plus the six ambiguous phrasings
+      above and 7 "unanswerable" questions about data the warehouse
+      genuinely doesn't have (no `products`/`employees` table, no
+      precomputed churn/forecast metric), rising in difficulty 1-5
+      within and across categories.
+- [x] `evaluation/runner.py`: `run_benchmark` runs every question
+      through the real `run_agent_loop` (schema retrieval included)
+      against the local DuckDB warehouse -- the first thing in the
+      project to call it dozens of times in a row rather than once per
+      CLI invocation. `QuestionResult` scores two independent axes:
+      `outcome_correct` (did the agent reach the right *kind* of result
+      -- answered / asked for clarification / declined) and, only for
+      "success" questions that *did* succeed, `result_match` (the
+      agent's final SQL and the question's own `expected_sql` run
+      against the same connection, rows compared as a sorted multiset so
+      `ORDER BY` differences don't cause false mismatches) -- plus
+      `attempts` (steps taken) and `bytes_scanned`/`cost_usd` (via the
+      Phase 3 `estimate_bytes_scanned`, same pricing model path as
+      `ask`/`estimate-cost`). `BenchmarkReport` aggregates pass rate
+      overall, by category, and by difficulty, mean attempts, and total
+      cost. Verified the scoring itself isn't vacuous by deliberately
+      feeding a question with a *wrong* `expected_sql` (counting `orders`
+      instead of `customers`) through `run_benchmark` directly and
+      confirming it's correctly reported as `result_match=False` rather
+      than passing.
+- [x] New `benchmark` CLI command: runs `BENCHMARK` (optionally filtered
+      by `--category`, repeatable) against `--warehouse-dir`, prints the
+      pass/fail summary by category and difficulty plus mean attempts and
+      total estimated cost, lists any failing questions with what was
+      expected vs. what happened, optionally writes the full per-question
+      report as JSON (`--output`), and exits non-zero if anything failed.
+      Manually run against the real sample warehouse: 44/44 pass at
+      100% today; re-run filtered to just `--category ambiguous
+      --category unanswerable` (13/13) to confirm filtering and the new
+      clarification path both work through the actual CLI, not just unit
+      tests.
+- [x] Deduplicated warehouse-path plumbing surfaced while wiring the
+      benchmark in: `cli.py` had three near-identical private helpers
+      (`_build_catalog`, `_warehouse_info`, `_table_locations`) that the
+      evaluation runner would otherwise have had to copy a fourth time.
+      Moved them to where the data they describe already lives --
+      `warehouse_info_for`/`table_locations_for` in
+      `warehouse/generate.py`, `build_catalog` in `warehouse/load.py` --
+      and `cli.py` now calls those instead of defining its own; behavior
+      is unchanged (confirmed by the full suite passing before and after
+      and by re-running every CLI command manually), this was a pure
+      dependency-direction cleanup so the new `evaluation/runner.py`
+      didn't have to reach into `cli.py`'s private functions.
 
 ### Phase 6 — Polish
 - [ ] Optional local-model provider.
@@ -298,39 +370,39 @@ src/text_to_sql_agent/
 
 ## Resume point
 
-Phases 1-4 are implemented, installed in editable mode, and have been run
+Phases 1-5 are implemented, installed in editable mode, and have been run
 by hand end to end: every CLI command (`init-warehouse`, `inspect-schema`,
-`retrieve`, `validate`, `estimate-cost`, `ask`) against the real sample
-warehouse, the Athena/BigQuery adapters' error paths (missing required
-CLI options -> `click.UsageError`; optional driver not installed -> a
-clear `EngineExecutionError` message; `pyathena` actually installed in a
-scratch venv and exercised against the real driver with placeholder AWS
-credentials, confirming a real `botocore.exceptions.ClientError` comes
-back wrapped as `EngineExecutionError` rather than an unhandled
-traceback). The full test suite (187 tests, pre-existing plus the
-retrieval-flakiness fix) passes, re-run 5x in a row with no flakes.
+`retrieve`, `validate`, `estimate-cost`, `benchmark`, `ask`) against the
+real sample warehouse, the Athena/BigQuery adapters' error paths (missing
+required CLI options -> `click.UsageError`; optional driver not installed
+-> a clear `EngineExecutionError` message; `pyathena` actually installed
+in a scratch venv and exercised against the real driver with placeholder
+AWS credentials, confirming a real `botocore.exceptions.ClientError`
+comes back wrapped as `EngineExecutionError` rather than an unhandled
+traceback), `ask` against a deliberately ambiguous question (confirms the
+"question is ambiguous: ..." path, exit 1), and `benchmark` both
+unfiltered (44/44 pass) and filtered to `--category ambiguous --category
+unanswerable` (13/13 pass) with `--output` writing a valid JSON report.
+The full test suite (211 tests, pre-existing, unchanged by this phase's
+non-test code) passes.
 
-Pick up at **Phase 5** — the evaluation harness:
-- A 40-60 question benchmark across the difficulty curve
-  `ScriptedProvider` already spans (counts, aggregates, group-bys, joins,
-  a window function, a time filter) plus ambiguous questions, which
-  nothing currently covers -- these need disambiguation logic in the
-  provider/agent loop, not just more canned SQL, so designing that is
-  part of this phase, not a prerequisite for it.
-- Each benchmark question needs an expected result (or expected
-  rejection, for intentionally-unsafe/unanswerable ones) to score
-  against: execution accuracy (did it run), result-set match (did it
-  return the right rows), steps taken (draft/correction count), and cost
-  per question (reusing `estimate_bytes_scanned`).
-- A `report` CLI command (or `benchmark` subcommand) that runs the suite
-  against the local DuckDB warehouse and prints/writes a summary -- this
-  is the first command that calls `run_agent_loop` many times in a row,
-  so it's also where any remaining rough edges in the retry loop's
-  determinism or audit-trace volume would surface first.
-- Phase 4's adapters are complete but inherently can't be exercised against
-  a *real* Athena/BigQuery account from this environment (no cloud
-  credentials) -- that remains true for whoever picks this up next, too;
-  the manual verification record above (real driver, fake credentials) is
-  the ceiling of what's checkable here, not a gap to close before Phase 6.
+Pick up at **Phase 6** — polish:
+- CI (`.github/workflows/ci.yml`, running `pytest` on push/PR) already
+  exists from an earlier night; packaging (`pyproject.toml` extras for
+  `athena`/`bigquery`, the `dev` extra for `pytest`/`pytest-cov`) is
+  already in reasonable shape. What's left here is genuinely optional
+  per the original plan: an optional local-model `LLMProvider` (e.g.
+  wrapping an Ollama or llama.cpp model) alongside `ScriptedProvider`,
+  which would be the first provider where the retrieved `schema_context`
+  and correction-driven retries are read *semantically* rather than
+  being inert plumbing (see the architecture note above `ScriptedProvider`
+  ignoring both) -- and whatever documentation/polish gaps a fresh read
+  of the README turns up.
+- Nothing above blocks calling the project done: every phase in the
+  original plan (1-5) is complete, the safety contract, scan-cost guard,
+  multi-dialect execution, and evaluation harness are all real and
+  exercised, and the "optional" Phase 6 item was marked optional from
+  when this plan was first written, not added later to excuse skipping
+  it.
 
-STATUS: IN_PROGRESS
+STATUS: COMPLETE

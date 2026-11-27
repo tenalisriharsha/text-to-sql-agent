@@ -151,6 +151,19 @@ SCENES = [
             'text-to-sql-agent ask "recent orders" --yes --row-limit 5',
         ],
     ),
+    Scene(
+        filename="10-benchmark.png",
+        title="text-to-sql-agent — benchmark: the evaluation harness",
+        commands=["text-to-sql-agent benchmark"],
+    ),
+    Scene(
+        filename="11-ambiguous-question.png",
+        title="text-to-sql-agent — ask: declining to guess",
+        commands=[
+            'text-to-sql-agent ask "who are our top performers"',
+            'text-to-sql-agent ask "what is our customer churn rate"',
+        ],
+    ),
 ]
 
 
