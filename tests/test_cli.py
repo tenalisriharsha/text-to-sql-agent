@@ -8,12 +8,14 @@ questions, exactly as a user running the documented commands would see.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.cli import main
+from text_to_sql_agent.evaluation.benchmark import BENCHMARK, BenchmarkQuestion
 
 
 def test_init_warehouse_generates_the_documented_tables(tmp_path: Path):
@@ -566,6 +568,206 @@ def test_ask_row_limit_option_is_applied_to_the_executed_query(
 
     final_step = steps[-1]
     assert "LIMIT 2" in final_step["payload"]["sql"]
+
+
+def test_ask_ambiguous_question_declines_and_exits_nonzero(warehouse_dir: Path):
+    """README: an ambiguous question is surfaced as "question is ambiguous: ..."
+    and exits non-zero rather than running a query that might answer a
+    different question than the one asked."""
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["ask", "who are our top performers", "--warehouse-dir", str(warehouse_dir), "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "question is ambiguous" in result.output
+    assert "SQL:" not in result.output
+
+
+def test_ask_ambiguous_question_records_needs_clarification_outcome(
+    warehouse_dir: Path, tmp_path: Path
+):
+    audit_log = tmp_path / "trace.jsonl"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "ask",
+            "how is the business doing",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--yes",
+            "--audit-log",
+            str(audit_log),
+        ],
+    )
+
+    assert result.exit_code == 1
+    steps = AuditTrace.load(audit_log)
+    step_types = [step["step_type"] for step in steps]
+    assert "needs_clarification" in step_types
+    assert "execution_result" not in step_types
+    final = steps[-1]
+    assert final["payload"]["outcome"] == "needs_clarification"
+    assert final["payload"]["reason"]
+
+
+def test_benchmark_default_run_passes_every_bundled_question(warehouse_dir: Path):
+    """PROGRESS.md: the bundled 44-question benchmark passes 100% against
+    the real sample warehouse -- this is the evaluation harness's own
+    headline claim, exercised end to end with nothing mocked."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["benchmark", "--warehouse-dir", str(warehouse_dir)])
+
+    assert result.exit_code == 0, result.output
+    total = len(BENCHMARK)
+    assert f"{total}/{total} passed (100%)" in result.output
+    assert "by category:" in result.output
+    assert "by difficulty:" in result.output
+    assert "failing question(s)" not in result.output
+
+
+def test_benchmark_category_filter_restricts_report_to_requested_categories(
+    warehouse_dir: Path,
+):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--category",
+            "ambiguous",
+            "--category",
+            "unanswerable",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected_total = sum(
+        1 for q in BENCHMARK if q.category in {"ambiguous", "unanswerable"}
+    )
+    assert f"{expected_total}/{expected_total} passed (100%)" in result.output
+    category_section = result.output.split("by category:")[1].split("by difficulty:")[0]
+    assert "ambiguous" in category_section
+    assert "unanswerable" in category_section
+    assert "count" not in category_section
+    assert "aggregate" not in category_section
+
+
+def test_benchmark_unknown_category_is_a_usage_error(warehouse_dir: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["benchmark", "--warehouse-dir", str(warehouse_dir), "--category", "not-a-real-category"],
+    )
+
+    assert result.exit_code != 0
+    assert "no benchmark questions match category filter" in result.output
+
+
+def test_benchmark_output_option_writes_a_valid_json_report(
+    warehouse_dir: Path, tmp_path: Path
+):
+    report_path = tmp_path / "report.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--category",
+            "count",
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text())
+    assert report["total"] == sum(1 for q in BENCHMARK if q.category == "count")
+    assert report["passed"] == report["total"]
+    assert report["accuracy"] == 1.0
+    assert len(report["results"]) == report["total"]
+    assert all(r["category"] == "count" for r in report["results"])
+
+
+def test_benchmark_pricing_model_option_changes_estimated_cost(warehouse_dir: Path):
+    runner = CliRunner()
+    athena = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--category",
+            "aggregate",
+            "--pricing-model",
+            "athena",
+        ],
+    )
+    bigquery = runner.invoke(
+        main,
+        [
+            "benchmark",
+            "--warehouse-dir",
+            str(warehouse_dir),
+            "--category",
+            "aggregate",
+            "--pricing-model",
+            "bigquery",
+        ],
+    )
+
+    assert athena.exit_code == 0, athena.output
+    assert bigquery.exit_code == 0, bigquery.output
+    assert "(athena pricing)" in athena.output
+    assert "(bigquery pricing)" in bigquery.output
+
+    def _cost(output: str) -> float:
+        return float(output.split("est. cost $")[1].split(" ")[0])
+
+    assert _cost(bigquery.output) > _cost(athena.output)
+
+
+def test_benchmark_reports_failing_questions_and_exits_nonzero(
+    monkeypatch, warehouse_dir: Path, tmp_path: Path
+):
+    """Swaps in a single bundled question with a deliberately wrong
+    expected_sql (same technique PROGRESS.md describes using to confirm
+    scoring isn't vacuous) to check the CLI's own failure-reporting path --
+    exit code, the failing-question listing, and a JSON report that
+    reflects the failure -- without mocking anything the pipeline itself
+    runs through."""
+    wrong_question = BenchmarkQuestion(
+        "count-01",
+        "how many customers do we have",
+        "count",
+        1,
+        "success",
+        "SELECT COUNT(*) AS n FROM orders",  # wrong table on purpose
+    )
+    monkeypatch.setattr("text_to_sql_agent.cli.BENCHMARK", (wrong_question,))
+
+    report_path = tmp_path / "report.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["benchmark", "--warehouse-dir", str(warehouse_dir), "--output", str(report_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "0/1 passed (0%)" in result.output
+    assert "1 failing question(s):" in result.output
+    assert "count-01" in result.output
+
+    report = json.loads(report_path.read_text())
+    assert report["passed"] == 0
+    assert report["results"][0]["result_match"] is False
 
 
 def test_ask_without_yes_on_a_low_cost_question_still_prompts_for_approval(
