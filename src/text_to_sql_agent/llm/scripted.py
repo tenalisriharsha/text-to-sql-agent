@@ -4,7 +4,9 @@ It matches keywords in the question against a fixed set of rules and
 returns the corresponding canned SQL. There is no model and no network
 call involved, so behavior never varies between runs, which is exactly
 what an automated test suite needs. It is not a general text-to-SQL
-engine: questions it doesn't recognize raise ``UnsupportedQuestionError``.
+engine: questions it doesn't recognize raise ``UnsupportedQuestionError``,
+and questions that are recognized but have no single correct SQL
+interpretation raise ``ClarificationNeededError`` instead of guessing.
 """
 
 from __future__ import annotations
@@ -19,11 +21,92 @@ class UnsupportedQuestionError(Exception):
     """Raised when no scripted rule matches the question."""
 
 
+class ClarificationNeededError(Exception):
+    """Raised when a question is recognized but has no single correct query.
+
+    A question like "top performers" doesn't say what makes a performer
+    "top" (revenue? order count?) or even which table to look in
+    (customers' orders? raw events?) -- picking one interpretation
+    silently would answer a different question than the one asked. This
+    carries the ambiguity itself (``reason``) and the concrete rephrasings
+    that would resolve it (``options``), so a caller can surface them
+    instead of guessing.
+    """
+
+    def __init__(self, question: str, reason: str, options: tuple[str, ...] = ()) -> None:
+        super().__init__(reason)
+        self.question = question
+        self.reason = reason
+        self.options = options
+
+
 @dataclass(frozen=True)
 class _Rule:
     name: str
     keywords: tuple[str, ...]
     sql: str
+
+
+@dataclass(frozen=True)
+class _AmbiguousRule:
+    name: str
+    keywords: tuple[str, ...]
+    reason: str
+    options: tuple[str, ...]
+
+
+# Checked before `_RULES`: a phrase here is recognizable but under-specified
+# enough that two people could mean different queries by it. Each entry's
+# `options` are concrete rephrasings that *do* match a `_RULES` keyword, so
+# a caller can offer them back to the user verbatim instead of guessing.
+_AMBIGUOUS_RULES: tuple[_AmbiguousRule, ...] = (
+    _AmbiguousRule(
+        name="top_performers",
+        keywords=("top performers", "best performers"),
+        reason=(
+            "'performer' isn't a metric -- it could mean highest revenue, "
+            "most orders, or most events, and over customers or orders."
+        ),
+        options=("top customers by spend", "orders by status", "events by type"),
+    ),
+    _AmbiguousRule(
+        name="recent_activity",
+        keywords=("recent activity", "latest activity"),
+        reason=(
+            "'activity' spans two different tables here (orders and "
+            "events) with no shared definition, and 'recent' has no "
+            "stated window."
+        ),
+        options=("orders from the last week", "events by type"),
+    ),
+    _AmbiguousRule(
+        name="business_health",
+        keywords=("how is the business doing", "how's the business doing", "business doing well"),
+        reason="no metric or time window is named -- revenue, order volume, and signups would each tell a different story.",
+        options=("total revenue", "how many orders", "customers by country"),
+    ),
+    _AmbiguousRule(
+        name="last_month_numbers",
+        keywords=("last month's numbers", "last month numbers"),
+        reason=(
+            "'last month' could mean the trailing 30 days or the previous "
+            "calendar month, and 'numbers' doesn't say which metric."
+        ),
+        options=("orders from the last week", "total revenue"),
+    ),
+    _AmbiguousRule(
+        name="customer_activity_summary",
+        keywords=("customer activity summary", "activity summary for customers"),
+        reason="'activity' could mean orders placed, events logged, or both, with no stated metric for either.",
+        options=("events per customer", "order details"),
+    ),
+    _AmbiguousRule(
+        name="growth",
+        keywords=("our growth", "how much have we grown", "growth this quarter"),
+        reason="growth of what (customers, revenue, orders) and over what baseline period isn't stated.",
+        options=("customers by country", "total revenue", "how many orders"),
+    ),
+)
 
 
 _RULES: tuple[_Rule, ...] = (
@@ -139,6 +222,11 @@ class ScriptedProvider(LLMProvider):
             return correction.previous_sql
 
         normalized = _normalize(question)
+
+        for ambiguous in _AMBIGUOUS_RULES:
+            if any(keyword in normalized for keyword in ambiguous.keywords):
+                raise ClarificationNeededError(question, ambiguous.reason, ambiguous.options)
+
         for rule in _RULES:
             if any(keyword in normalized for keyword in rule.keywords):
                 return rule.sql
