@@ -10,6 +10,8 @@ from text_to_sql_agent.warehouse.generate import (
     EVENT_TYPES,
     ORDER_STATUSES,
     generate_warehouse,
+    table_locations_for,
+    warehouse_info_for,
 )
 
 
@@ -117,3 +119,39 @@ def test_generate_warehouse_different_seeds_produce_different_customers(tmp_path
     assert pq.read_table(first.customers_path).to_pylist() != pq.read_table(
         second.customers_path
     ).to_pylist()
+
+
+def test_warehouse_info_for_matches_the_layout_generate_warehouse_wrote(tmp_path: Path):
+    """warehouse_info_for is pure path construction (Phase 5), consolidated
+    out of cli.py so the evaluation runner could reuse it without
+    regenerating the warehouse -- it must describe the exact same layout
+    generate_warehouse itself returns."""
+    generated = generate_warehouse(tmp_path, seed=1, num_customers=5, num_orders=5, num_days=1)
+
+    info = warehouse_info_for(tmp_path)
+
+    assert info == generated
+
+
+def test_warehouse_info_for_does_not_require_the_warehouse_to_exist(tmp_path: Path):
+    """Pure path construction: it must not read or generate anything, so it
+    can be called before the warehouse is written at all."""
+    missing_dir = tmp_path / "not-generated-yet"
+    info = warehouse_info_for(missing_dir)
+
+    assert info.root == missing_dir
+    assert info.customers_path == missing_dir / "customers.parquet"
+    assert info.orders_path == missing_dir / "orders.parquet"
+    assert info.events_root == missing_dir / "events"
+
+
+def test_table_locations_for_covers_every_table_with_events_partitioned(tmp_path: Path):
+    generate_warehouse(tmp_path, seed=1, num_customers=5, num_orders=5, num_days=1)
+
+    locations = table_locations_for(tmp_path)
+
+    assert set(locations) == {"customers", "orders", "events"}
+    assert locations["customers"].partition_column is None
+    assert locations["orders"].partition_column is None
+    assert locations["events"].partition_column == "event_date"
+    assert locations["events"].path == tmp_path / "events"

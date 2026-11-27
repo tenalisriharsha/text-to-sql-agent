@@ -58,3 +58,32 @@ def test_load_into_duckdb_handles_paths_containing_single_quotes(tmp_path):
         assert count == 5
     finally:
         connection.close()
+
+
+def test_build_catalog_loads_the_warehouse_and_returns_its_full_schema(tmp_path):
+    """build_catalog (Phase 5) is the one path every command that needs a
+    catalog without keeping its own connection open goes through -- it must
+    open, introspect, and close without leaking the connection or losing
+    any table."""
+    from text_to_sql_agent.warehouse.generate import generate_warehouse
+    from text_to_sql_agent.warehouse.load import build_catalog
+
+    generate_warehouse(tmp_path, seed=8, num_customers=5, num_orders=5, num_days=1)
+
+    catalog = build_catalog(tmp_path)
+
+    assert set(catalog.table_names) == {"customers", "orders", "events"}
+    customers_table = catalog.get("customers")
+    assert customers_table is not None
+    assert set(customers_table.column_names) >= {"customer_id", "name", "country"}
+
+
+def test_build_catalog_accepts_a_string_path_as_well_as_a_path(tmp_path):
+    from text_to_sql_agent.warehouse.generate import generate_warehouse
+    from text_to_sql_agent.warehouse.load import build_catalog
+
+    generate_warehouse(tmp_path, seed=9, num_customers=5, num_orders=5, num_days=1)
+
+    catalog = build_catalog(str(tmp_path))
+
+    assert set(catalog.table_names) == {"customers", "orders", "events"}
