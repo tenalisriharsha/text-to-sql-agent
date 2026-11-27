@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import duckdb
 
-from text_to_sql_agent.warehouse.generate import WarehouseInfo
+from text_to_sql_agent.schema_catalog import SchemaCatalog
+from text_to_sql_agent.warehouse.generate import (
+    COLUMN_DESCRIPTIONS,
+    PARTITION_COLUMNS,
+    TABLE_DESCRIPTIONS,
+    WarehouseInfo,
+    warehouse_info_for,
+)
 
 
 def load_into_duckdb(
@@ -33,3 +42,24 @@ def load_into_duckdb(
 
 def _escape(path: object) -> str:
     return str(path).replace("'", "''")
+
+
+def build_catalog(warehouse_dir: Path | str) -> SchemaCatalog:
+    """Load the warehouse at ``warehouse_dir`` and build the catalog from it.
+
+    A short-lived DuckDB connection is used just for introspection and
+    closed before returning; every command (`inspect-schema`, `retrieve`,
+    `validate`, `estimate-cost`, `ask`, `benchmark`) that needs the catalog
+    without the connection itself goes through this one path.
+    """
+    connection = duckdb.connect()
+    try:
+        load_into_duckdb(connection, warehouse_info_for(Path(warehouse_dir)))
+        return SchemaCatalog.from_duckdb(
+            connection,
+            table_descriptions=TABLE_DESCRIPTIONS,
+            column_descriptions=COLUMN_DESCRIPTIONS,
+            partition_columns=PARTITION_COLUMNS,
+        )
+    finally:
+        connection.close()

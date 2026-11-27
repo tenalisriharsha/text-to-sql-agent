@@ -17,6 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from faker import Faker
 
+from text_to_sql_agent.cost_estimate import TableLocation
+
 ORDER_STATUSES = ("pending", "completed", "cancelled", "refunded")
 EVENT_TYPES = ("page_view", "add_to_cart", "purchase", "signup", "login")
 COUNTRIES = ("US", "GB", "DE", "IN", "BR", "CA", "AU", "FR")
@@ -64,6 +66,35 @@ class WarehouseInfo:
     customers_path: Path
     orders_path: Path
     events_root: Path
+
+
+def warehouse_info_for(output_dir: Path) -> WarehouseInfo:
+    """The :class:`WarehouseInfo` for a warehouse already written to ``output_dir``.
+
+    Pure path construction -- it doesn't generate or read anything -- so any
+    caller that already has a warehouse on disk (the CLI, the evaluation
+    harness) can rebuild the same layout `generate_warehouse` returns
+    without regenerating it.
+    """
+    output_dir = Path(output_dir)
+    return WarehouseInfo(
+        root=output_dir,
+        customers_path=output_dir / "customers.parquet",
+        orders_path=output_dir / "orders.parquet",
+        events_root=output_dir / "events",
+    )
+
+
+def table_locations_for(output_dir: Path) -> dict[str, TableLocation]:
+    """Where each table's Parquet data lives, for `cost_estimate.estimate_bytes_scanned`."""
+    info = warehouse_info_for(output_dir)
+    return {
+        "customers": TableLocation(path=info.customers_path),
+        "orders": TableLocation(path=info.orders_path),
+        "events": TableLocation(
+            path=info.events_root, partition_column=PARTITION_COLUMNS["events"][0]
+        ),
+    }
 
 
 def generate_warehouse(

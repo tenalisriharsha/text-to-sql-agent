@@ -19,7 +19,7 @@ from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig
 from text_to_sql_agent.engines.base import EngineExecutionError
 from text_to_sql_agent.llm.base import CorrectionContext, LLMProvider
-from text_to_sql_agent.llm.scripted import UnsupportedQuestionError
+from text_to_sql_agent.llm.scripted import ClarificationNeededError, UnsupportedQuestionError
 from text_to_sql_agent.sql.validator import ValidationResult, validate_query
 
 
@@ -32,6 +32,9 @@ class AgentResult:
     and the engine's ``EXPLAIN``. ``draft_error`` is set instead of
     ``validation`` when the provider could not draft anything at all (for
     example, ``ScriptedProvider`` has no rule matching the question).
+    ``needs_clarification`` is set instead when the provider recognized the
+    question but judged it to have no single correct interpretation --
+    this is a deliberate refusal to guess, not a failure to understand.
     """
 
     sql: str | None
@@ -39,6 +42,7 @@ class AgentResult:
     explain_plan: str | None
     attempts: int
     draft_error: str | None = None
+    needs_clarification: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -76,6 +80,17 @@ def run_agent_loop(
     for attempt in range(1, attempts + 1):
         try:
             sql = provider.draft_sql(question, schema_context, dialect, correction)
+        except ClarificationNeededError as exc:
+            trace.record(
+                "needs_clarification", attempt=attempt, reason=exc.reason, options=list(exc.options)
+            )
+            return AgentResult(
+                sql=None,
+                validation=None,
+                explain_plan=None,
+                attempts=attempt,
+                needs_clarification=exc.reason,
+            )
         except UnsupportedQuestionError as exc:
             trace.record("draft_failed", attempt=attempt, error=str(exc))
             return AgentResult(

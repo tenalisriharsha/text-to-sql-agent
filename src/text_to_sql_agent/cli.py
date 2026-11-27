@@ -17,6 +17,7 @@ approval, regardless of ``--yes``.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -27,21 +28,17 @@ import duckdb
 from text_to_sql_agent.agent import run_agent_loop
 from text_to_sql_agent.audit import AuditTrace
 from text_to_sql_agent.config import AgentConfig, BudgetConfig, pricing_model_for
-from text_to_sql_agent.cost_estimate import TableLocation, estimate_bytes_scanned
+from text_to_sql_agent.cost_estimate import estimate_bytes_scanned
 from text_to_sql_agent.engines.athena_engine import AthenaConfig, AthenaConnection
 from text_to_sql_agent.engines.base import EngineExecutionError
 from text_to_sql_agent.engines.bigquery_engine import BigQueryConfig, BigQueryConnection
+from text_to_sql_agent.evaluation.benchmark import BENCHMARK
+from text_to_sql_agent.evaluation.runner import run_benchmark
 from text_to_sql_agent.llm.scripted import ScriptedProvider
 from text_to_sql_agent.retrieval import SchemaRetriever
-from text_to_sql_agent.schema_catalog import SchemaCatalog
 from text_to_sql_agent.sql.validator import validate_query
-from text_to_sql_agent.warehouse.generate import (
-    COLUMN_DESCRIPTIONS,
-    PARTITION_COLUMNS,
-    TABLE_DESCRIPTIONS,
-    generate_warehouse,
-)
-from text_to_sql_agent.warehouse.load import load_into_duckdb
+from text_to_sql_agent.warehouse.generate import generate_warehouse, table_locations_for, warehouse_info_for
+from text_to_sql_agent.warehouse.load import build_catalog, load_into_duckdb
 
 DEFAULT_WAREHOUSE_DIR = Path("data/warehouse")
 
@@ -77,7 +74,7 @@ def init_warehouse(output_dir: Path, seed: int) -> None:
 )
 def inspect_schema(warehouse_dir: Path) -> None:
     """Print the schema catalog built from the sample warehouse."""
-    catalog = _build_catalog(warehouse_dir)
+    catalog = build_catalog(warehouse_dir)
     click.echo(catalog.to_text())
 
 
@@ -110,7 +107,7 @@ def retrieve(question: str, warehouse_dir: Path, top_k_tables: int | None, top_k
     table's/column's name, description, and sample values -- no network
     call or embedding API is involved.
     """
-    catalog = _build_catalog(warehouse_dir)
+    catalog = build_catalog(warehouse_dir)
     retriever = SchemaRetriever(catalog)
 
     click.echo("ranked tables:")
@@ -142,7 +139,7 @@ def validate(sql: str, warehouse_dir: Path, dialect: str, row_limit: int | None)
     Reports whether SQL is a single, read-only, allowlisted statement, and
     prints the normalized query (with LIMIT enforced) if so.
     """
-    catalog = _build_catalog(warehouse_dir)
+    catalog = build_catalog(warehouse_dir)
     default_row_limit = row_limit if row_limit is not None else AgentConfig().default_row_limit
     result = validate_query(
         sql,
@@ -190,7 +187,7 @@ def estimate_cost(
     clause actually allows, and restricting every table to the columns its
     SELECT list, WHERE clause, GROUP BY, and ORDER BY actually reference.
     """
-    catalog = _build_catalog(warehouse_dir)
+    catalog = build_catalog(warehouse_dir)
     default_row_limit = row_limit if row_limit is not None else AgentConfig().default_row_limit
     result = validate_query(
         sql,
@@ -205,7 +202,7 @@ def estimate_cost(
         sys.exit(1)
 
     assert result.normalized_sql is not None
-    scan = estimate_bytes_scanned(result.normalized_sql, dialect, _table_locations(warehouse_dir))
+    scan = estimate_bytes_scanned(result.normalized_sql, dialect, table_locations_for(warehouse_dir))
     cost = pricing_model_for(pricing_model).estimate_cost_usd(scan.total_bytes)
 
     click.echo(f"total: {scan.total_bytes} bytes (~${cost:.6f}, {pricing_model} pricing)")
@@ -220,6 +217,109 @@ def estimate_cost(
                 f"    partitions scanned: {len(estimate.partitions_scanned)} "
                 f"({', '.join(estimate.partitions_scanned) or 'none'})"
             )
+
+
+@main.command("benchmark")
+@click.option(
+    "--warehouse-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=DEFAULT_WAREHOUSE_DIR,
+    show_default=True,
+)
+@click.option(
+    "--category",
+    multiple=True,
+    help=(
+        "Restrict to one or more categories (repeatable): count, aggregate, "
+        "groupby, join, top_n, time_filter, window, ambiguous, unanswerable. "
+        "Default: every question in the benchmark."
+    ),
+)
+@click.option(
+    "--pricing-model",
+    type=click.Choice(["athena", "bigquery"]),
+    default="athena",
+    show_default=True,
+)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write the full per-question report as JSON to this path.",
+)
+@click.option("--max-correction-attempts", type=int, default=None)
+@click.option("--top-k-tables", type=int, default=None)
+@click.option("--top-k-columns", type=int, default=None)
+def benchmark(
+    warehouse_dir: Path,
+    category: tuple[str, ...],
+    pricing_model: str,
+    output: Path | None,
+    max_correction_attempts: int | None,
+    top_k_tables: int | None,
+    top_k_columns: int | None,
+) -> None:
+    """Run the bundled benchmark against the sample warehouse and score it.
+
+    Every question goes through the same draft/validate/EXPLAIN loop `ask`
+    runs, against `--dialect duckdb` only -- this measures the pipeline
+    itself (retrieval, drafting, validation, self-correction, scan cost),
+    independent of any particular cloud account. Scoring checks both
+    whether the agent reached the right *kind* of outcome (answered /
+    asked for clarification / declined as unanswerable) and, for questions
+    it should answer, whether it returned the right rows.
+    """
+    defaults = AgentConfig()
+    config = AgentConfig(
+        max_correction_attempts=max_correction_attempts
+        if max_correction_attempts is not None
+        else defaults.max_correction_attempts,
+        retrieval_top_k_tables=top_k_tables if top_k_tables is not None else defaults.retrieval_top_k_tables,
+        retrieval_top_k_columns_per_table=top_k_columns
+        if top_k_columns is not None
+        else defaults.retrieval_top_k_columns_per_table,
+    )
+
+    questions = BENCHMARK
+    if category:
+        wanted = set(category)
+        questions = tuple(q for q in questions if q.category in wanted)
+        if not questions:
+            raise click.UsageError(f"no benchmark questions match category filter: {', '.join(category)}")
+
+    report = run_benchmark(questions, warehouse_dir, config=config, pricing_model=pricing_model)
+
+    click.echo(
+        f"{report.passed}/{report.total} passed ({report.accuracy:.0%}), "
+        f"mean attempts {report.mean_attempts:.2f}, "
+        f"est. cost ${report.total_cost_usd:.4f} ({pricing_model} pricing)"
+    )
+
+    click.echo("\nby category:")
+    for cat, (passed, total) in report.by_category().items():
+        click.echo(f"  {cat:<14} {passed}/{total}")
+
+    click.echo("\nby difficulty:")
+    for difficulty, (passed, total) in report.by_difficulty().items():
+        click.echo(f"  {difficulty}  {passed}/{total}")
+
+    failures = report.failures()
+    if failures:
+        click.echo(f"\n{len(failures)} failing question(s):")
+        for result in failures:
+            detail = f" -- {result.detail}" if result.detail else ""
+            click.echo(
+                f"  [{result.question_id}] expected {result.expected_outcome}, "
+                f"got {result.actual_outcome}{detail}"
+            )
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report.to_dict(), indent=2))
+        click.echo(f"\nfull report written to {output}")
+
+    if failures:
+        sys.exit(1)
 
 
 @main.command("ask")
@@ -361,7 +461,7 @@ def ask(
     trace = AuditTrace(audit_log)
     trace.record("question_received", question=question, dialect=dialect)
 
-    catalog = _build_catalog(warehouse_dir)
+    catalog = build_catalog(warehouse_dir)
     retriever = SchemaRetriever(catalog)
     retrieved_catalog = retriever.retrieve(
         question,
@@ -401,8 +501,14 @@ def ask(
         config,
         trace,
     )
+    if agent_result.needs_clarification is not None:
+        click.echo(f"question is ambiguous: {agent_result.needs_clarification}", err=True)
+        trace.record("final", outcome="needs_clarification", reason=agent_result.needs_clarification)
+        sys.exit(1)
+
     if agent_result.draft_error is not None:
         click.echo(f"could not answer the question: {agent_result.draft_error}", err=True)
+        trace.record("final", outcome="draft_failed", error=agent_result.draft_error)
         sys.exit(1)
 
     validation = agent_result.validation
@@ -428,7 +534,7 @@ def ask(
 
     demo_source = dialect == "duckdb"
     if demo_source:
-        scan = estimate_bytes_scanned(final_sql, dialect, _table_locations(warehouse_dir))
+        scan = estimate_bytes_scanned(final_sql, dialect, table_locations_for(warehouse_dir))
         bytes_estimate = scan.total_bytes
         cost_estimate = config.budget.estimate_cost_usd(bytes_estimate)
         trace.record(
@@ -516,7 +622,7 @@ def _build_connection(
     """
     if dialect == "duckdb":
         connection = duckdb.connect()
-        load_into_duckdb(connection, _warehouse_info(warehouse_dir))
+        load_into_duckdb(connection, warehouse_info_for(warehouse_dir))
         return connection
     if dialect == "athena":
         if not athena_s3_staging_dir or not athena_region:
@@ -536,39 +642,6 @@ def _build_connection(
             raise click.UsageError("--dialect bigquery requires --bigquery-project")
         return BigQueryConnection(BigQueryConfig(project=bigquery_project, location=bigquery_location))
     raise click.UsageError(f"unsupported dialect '{dialect}'")
-
-
-def _build_catalog(warehouse_dir: Path) -> SchemaCatalog:
-    connection = duckdb.connect()
-    load_into_duckdb(connection, _warehouse_info(warehouse_dir))
-    return SchemaCatalog.from_duckdb(
-        connection,
-        table_descriptions=TABLE_DESCRIPTIONS,
-        column_descriptions=COLUMN_DESCRIPTIONS,
-        partition_columns=PARTITION_COLUMNS,
-    )
-
-
-def _warehouse_info(warehouse_dir: Path):
-    from text_to_sql_agent.warehouse.generate import WarehouseInfo
-
-    return WarehouseInfo(
-        root=warehouse_dir,
-        customers_path=warehouse_dir / "customers.parquet",
-        orders_path=warehouse_dir / "orders.parquet",
-        events_root=warehouse_dir / "events",
-    )
-
-
-def _table_locations(warehouse_dir: Path) -> dict[str, TableLocation]:
-    info = _warehouse_info(warehouse_dir)
-    return {
-        "customers": TableLocation(path=info.customers_path),
-        "orders": TableLocation(path=info.orders_path),
-        "events": TableLocation(
-            path=info.events_root, partition_column=PARTITION_COLUMNS["events"][0]
-        ),
-    }
 
 
 if __name__ == "__main__":
