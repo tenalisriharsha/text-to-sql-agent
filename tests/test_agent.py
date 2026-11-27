@@ -258,6 +258,50 @@ def test_max_correction_attempts_bounds_total_attempts(connection):
     assert len(provider.corrections) == 2
 
 
+def test_ambiguous_question_sets_needs_clarification_without_consuming_retries(connection):
+    """PROGRESS.md Phase 5: ClarificationNeededError is caught the same way
+    UnsupportedQuestionError already was -- no retry, immediate return --
+    and distinct from draft_error (which means "no rule matched at all")."""
+    trace = AuditTrace()
+    config = AgentConfig(max_correction_attempts=3)
+    result = run_agent_loop(
+        ScriptedProvider(),
+        "who are our top performers",
+        "",
+        TABLE_ALLOWLIST,
+        "duckdb",
+        connection,
+        config,
+        trace,
+    )
+
+    assert not result.succeeded
+    assert result.needs_clarification is not None
+    assert result.draft_error is None
+    assert result.validation is None
+    assert result.sql is None
+    assert result.attempts == 1
+    assert [step.step_type for step in trace.steps] == ["needs_clarification"]
+
+
+def test_needs_clarification_audit_step_carries_reason_and_options(connection):
+    trace = AuditTrace()
+    result = run_agent_loop(
+        ScriptedProvider(),
+        "how is the business doing",
+        "",
+        TABLE_ALLOWLIST,
+        "duckdb",
+        connection,
+        AgentConfig(),
+        trace,
+    )
+    step = trace.steps[0]
+    assert step.step_type == "needs_clarification"
+    assert step.payload["reason"] == result.needs_clarification
+    assert step.payload["options"], "clarification options should be non-empty"
+
+
 def test_zero_correction_attempts_means_a_single_try(connection):
     trace = AuditTrace()
     provider = _FixedProvider("SELECT * FROM secret_table")

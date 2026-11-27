@@ -11,10 +11,33 @@ from __future__ import annotations
 import pytest
 
 from text_to_sql_agent.llm.base import CorrectionContext, LLMProvider
-from text_to_sql_agent.llm.scripted import ScriptedProvider, UnsupportedQuestionError
+from text_to_sql_agent.llm.scripted import (
+    ClarificationNeededError,
+    ScriptedProvider,
+    UnsupportedQuestionError,
+)
 from text_to_sql_agent.sql.validator import validate_query
 
 TABLE_ALLOWLIST = ("customers", "orders", "events")
+
+# The six phrasings README/PROGRESS.md document as deliberately ambiguous:
+# recognizable, but with no stated metric, time window, or table.
+AMBIGUOUS_QUESTIONS = [
+    "who are our top performers",
+    "best performers this month",
+    "show me recent activity",
+    "latest activity",
+    "how is the business doing",
+    "how's the business doing",
+    "business doing well",
+    "what are last month's numbers",
+    "last month numbers",
+    "give me a customer activity summary",
+    "activity summary for customers",
+    "how much have we grown",
+    "our growth",
+    "growth this quarter",
+]
 
 
 def test_scripted_provider_is_an_llm_provider():
@@ -123,3 +146,51 @@ def test_events_per_customer_question_joins_events_and_customers():
     result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
     assert result.is_valid, result.errors
     assert set(result.referenced_tables) == {"customers", "events"}
+
+
+@pytest.mark.parametrize("question", AMBIGUOUS_QUESTIONS)
+def test_ambiguous_question_raises_clarification_needed_instead_of_guessing(question: str):
+    """PROGRESS.md Phase 5: these are recognizable but under-specified (no
+    stated metric, time window, or table), so draft_sql must refuse to
+    guess one interpretation rather than silently drafting SQL."""
+    provider = ScriptedProvider()
+    with pytest.raises(ClarificationNeededError) as excinfo:
+        provider.draft_sql(question, "")
+
+    assert excinfo.value.question == question
+    assert excinfo.value.reason
+    assert excinfo.value.options
+
+
+def test_clarification_needed_error_is_not_an_unsupported_question_error():
+    """The two error types mean different things (PROGRESS.md: "needs_clarification"
+    is distinct from "no rule matched at all") and callers branch on which one
+    was raised, so one must not be a subclass of the other."""
+    assert not issubclass(ClarificationNeededError, UnsupportedQuestionError)
+    assert not issubclass(UnsupportedQuestionError, ClarificationNeededError)
+
+
+@pytest.mark.parametrize("question", AMBIGUOUS_QUESTIONS)
+def test_ambiguous_question_options_are_concrete_rephrasings_that_resolve(question: str):
+    """Each ambiguous rule's `options` are documented as rephrasings that
+    *do* match a normal rule and draft real, valid SQL -- so a caller can
+    hand them back to the user as working suggestions, not more guesses."""
+    provider = ScriptedProvider()
+    with pytest.raises(ClarificationNeededError) as excinfo:
+        provider.draft_sql(question, "")
+
+    for option in excinfo.value.options:
+        sql = ScriptedProvider().draft_sql(option, "")
+        result = validate_query(sql, table_allowlist=TABLE_ALLOWLIST, dialect="duckdb")
+        assert result.is_valid, (option, result.errors)
+
+
+@pytest.mark.parametrize("question", AMBIGUOUS_QUESTIONS)
+def test_correction_bypasses_ambiguous_check_and_returns_previous_sql(question: str):
+    """draft_sql checks `correction` before the ambiguous-phrase rules, so a
+    retry attempt against a question that *looks* ambiguous on a fresh
+    draft must still just resend the previous SQL, not raise again."""
+    provider = ScriptedProvider()
+    correction = CorrectionContext(previous_sql="SELECT 1", error_message="irrelevant")
+    result = provider.draft_sql(question, "", correction=correction)
+    assert result == "SELECT 1"
