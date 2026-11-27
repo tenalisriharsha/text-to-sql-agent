@@ -39,7 +39,8 @@ gates execution.
 | ![validate enforces the safety contract](docs/screenshots/03-validate-safety.png) | ![Inspecting the schema catalog](docs/screenshots/04-inspect-schema.png) |
 | ![Dialect translation to BigQuery/Athena](docs/screenshots/05-dialect-translate.png) | ![Every step recorded to an audit trace](docs/screenshots/06-audit-trace.png) |
 | ![Schema retrieval narrows the catalog to a question](docs/screenshots/07-retrieve.png) | ![A window function and a time-filtered question](docs/screenshots/08-advanced-queries.png) |
-| ![estimate-cost and the scan-cost guard](docs/screenshots/09-cost-guard.png) | |
+| ![estimate-cost and the scan-cost guard](docs/screenshots/09-cost-guard.png) | ![benchmark scores the evaluation harness](docs/screenshots/10-benchmark.png) |
+| ![ask declines to guess an ambiguous or unanswerable question](docs/screenshots/11-ambiguous-question.png) | |
 
 ## How it works
 
@@ -55,6 +56,9 @@ SchemaRetriever.retrieve(question)  -- narrows the catalog to its top-k
    |                                   cosine similarity (local, no API)
    v
 LLMProvider.draft_sql(question, schema_context, correction?)
+   |  -- ambiguous question (no stated metric/window/table) --> ask for
+   |     clarification instead of guessing, no SQL drafted
+   |  -- unrecognized question --> declined as unanswerable
    v
 validate_query()  --sqlglot AST checks--> reject, retry with error
    v
@@ -97,6 +101,16 @@ text-to-sql-agent estimate-cost "SELECT * FROM events WHERE event_date = '2026-0
     [--warehouse-dir data/warehouse] \
     [--row-limit N] \
     [--pricing-model athena|bigquery]
+
+# Run the bundled benchmark and score it
+text-to-sql-agent benchmark \
+    [--warehouse-dir data/warehouse] \
+    [--category count|aggregate|groupby|join|top_n|time_filter|window|ambiguous|unanswerable ...] \
+    [--pricing-model athena|bigquery] \
+    [--output report.json] \
+    [--max-correction-attempts N] \
+    [--top-k-tables N] \
+    [--top-k-columns N]
 
 # Ask a question
 text-to-sql-agent ask "QUESTION" \
@@ -152,6 +166,16 @@ retrieved schema context are plumbed through
 `text_to_sql_agent.agent.run_agent_loop`, the draft/validate/EXPLAIN/
 retry loop `ask` runs, independent of the CLI.
 
+It also recognizes a second kind of question it deliberately declines to
+guess at: a handful of phrasings ("top performers", "recent activity",
+"how is the business doing", ...) are recognizable but genuinely
+under-specified — no stated metric, time window, or table — so instead of
+silently picking one interpretation, `draft_sql` raises
+`ClarificationNeededError` with the ambiguity and a few concrete
+rephrasings that *would* resolve it. `ask` surfaces this as "question is
+ambiguous: ..." and exits non-zero rather than running a query that might
+answer a different question than the one asked.
+
 ## Safety contract
 
 Every candidate query, however it was drafted, must pass
@@ -202,6 +226,36 @@ a dynamic predicate like `CURRENT_DATE - INTERVAL`, a bare `*`) falls back
 to charging for more bytes, never fewer. `ask` runs this automatically
 before executing; `estimate-cost` runs it directly against any SQL string
 for inspection.
+
+## Evaluation harness
+
+`text_to_sql_agent.evaluation.benchmark.BENCHMARK` is a fixed set of 44
+natural-language questions spanning the difficulty curve `ScriptedProvider`
+supports — counts, aggregates, group-bys, two kinds of join, a top-N
+ranking, a relative-date time filter, and a window function, each via
+several independent phrasings — plus questions that should *not* get a
+query at all: six genuinely ambiguous ones (no stated metric, time window,
+or table) and seven unanswerable ones (asking about data the warehouse
+doesn't have, like products or employees). Every question carries what the
+*correct* outcome is: a `"success"` question carries its own `expected_sql`
+(authored independently of `ScriptedProvider`, not copied from it) to check
+rows against; a `"clarification"` or `"unanswerable"` question just checks
+that the agent reached that outcome instead of answering.
+
+```bash
+text-to-sql-agent benchmark
+```
+
+runs every question through the exact same draft/validate/EXPLAIN loop
+`ask` runs — against the local DuckDB warehouse only, since this measures
+the pipeline itself (retrieval, drafting, validation, self-correction,
+scan cost) rather than any particular cloud account — and reports pass/fail
+by category and difficulty, mean correction attempts, and total estimated
+cost. `--category` restricts to one or more categories (repeatable),
+`--output` writes the full per-question breakdown as JSON, and
+`--pricing-model`/`--max-correction-attempts`/`--top-k-tables`/
+`--top-k-columns` match the same-named options on `ask`. It exits non-zero
+if any question fails.
 
 ## Execution engines
 
@@ -263,18 +317,16 @@ unmodified.
 
 ## Status
 
-This project is under active development. Phase 1 (project scaffold and
-core foundation — schema catalog, sample warehouse generator, SQL
-validator, pluggable LLM provider interface, audit trace, and the CLI
-wiring them together), Phase 2 (local TF-IDF schema retrieval,
-engine-error-driven self-correction via a real `EXPLAIN` check inside the
-retry loop, and a broader `ScriptedProvider` difficulty curve), Phase 3
-(the partition/column pruning-aware scan-cost guard above, and
-`BudgetConfig`/`PricingModel` selection wired into the CLI), and Phase 4
-(the Athena and BigQuery execution adapters above, and mandatory approval
-for non-`duckdb` dialects) are complete. The evaluation harness is
-planned. See [PROGRESS.md](PROGRESS.md) for the architecture, the full
-phased build plan, and exactly what's done versus planned next.
+Feature-complete: schema catalog and retrieval, the pluggable
+`ScriptedProvider` with ambiguity detection, the SQL safety contract, the
+partition/column-pruning-aware scan-cost guard, Athena/BigQuery execution
+adapters, the audit trace, and the 44-question evaluation harness are all
+implemented, tested, and exercised end to end against the bundled sample
+warehouse. See [PROGRESS.md](PROGRESS.md) for the architecture and the
+full phased build history, and [DAILY_REPORT.md](DAILY_REPORT.md) for a
+summary of what was built, test results, and known limitations.
+Plugging in a real (non-scripted) `LLMProvider` is the natural next step
+for anyone extending this.
 
 ## License
 
